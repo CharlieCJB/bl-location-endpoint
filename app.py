@@ -8,9 +8,12 @@ BL_API_URL = "https://api.baselinker.com/connector.php"
 BL_TOKEN   = os.environ.get("BL_TOKEN")
 SHARED_KEY = os.environ.get("BL_SHARED_KEY", "")
 
-# Your warehouse
+# Your warehouse and timeouts
 WAREHOUSE_ID = "77617"
 TIMEOUT      = 30  # seconds
+
+# Optional fallback if API doesn't return inventory_id
+FALLBACK_INVENTORY_ID = os.environ.get("INVENTORY_ID", "")
 
 app = Flask(__name__)
 
@@ -27,11 +30,12 @@ def bl_call(method: str, params: dict) -> dict:
     return j
 
 def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
-    """Prefer order_id. If only order_number is provided, search recent orders."""
+    """Prefer order_id (fast). If only order_number is provided, search recent orders."""
     if order_id:
         return str(order_id)
     if not order_number:
         abort(400, "Provide order_id or order_number")
+    # Search the last 365 days; widen if needed
     date_from = int(time.time()) - 365 * 24 * 60 * 60
     resp = bl_call("getOrders", {
         "date_confirmed_from": date_from,
@@ -43,24 +47,45 @@ def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> st
     abort(404, f"Order with order_number '{order_number}' not found in last 365 days")
 
 def get_inventory_id_for_any_product(product_id: str) -> str:
-    inv = bl_call("getInventoryProductsData", {"filter_ids": [product_id], "include": []})
+    """Fetch inventory_id for an inventory product; fallback to env if missing."""
+    inv = bl_call("getInventoryProductsData", {
+        "filter_ids": [product_id],
+        "include": ["inventory_id"]   # explicitly request it
+    })
     prods = inv.get("products", [])
-    if not prods or not prods[0].get("inventory_id"):
-        abort(404, f"Inventory product {product_id} not found or missing inventory_id")
-    return str(prods[0]["inventory_id"])
+    if prods and prods[0].get("inventory_id"):
+        return str(prods[0]["inventory_id"])
+    if FALLBACK_INVENTORY_ID:
+        return FALLBACK_INVENTORY_ID
+    abort(404, f"Inventory product {product_id} not found or missing inventory_id")
 
 def list_bins_in_warehouse_dynamic(warehouse_id: str,
                                    exclude_ids: set[str],
                                    dst_id: str) -> List[str]:
     """
-    Try to list all bin/location IDs for a warehouse via API.
-    If unavailable, fall back to env var SRC_BINS (comma-separated).
+    Discover all bin/location IDs for a warehouse via API; fallback to SRC_BINS env var.
     Excludes dst_id and anything in exclude_ids.
     """
-    # Attempt: some accounts expose locations nested in getInventoryWarehouses
+    # Try a dedicated locations endpoint first (if available in your account)
+    try:
+        resp = bl_call("getInventoryLocations", {"warehouse_id": warehouse_id})
+        bins: List[str] = []
+        for loc in resp.get("locations", []):
+            lid = str(loc.get("location_id", "")).strip()
+            if not lid:
+                continue
+            if lid == str(dst_id) or lid in exclude_ids:
+                continue
+            bins.append(lid)
+        if bins:
+            return bins
+    except Exception:
+        pass
+
+    # Try nested locations inside warehouses
     try:
         resp = bl_call("getInventoryWarehouses", {})
-        bins: List[str] = []
+        bins = []
         for wh in resp.get("warehouses", []):
             if str(wh.get("warehouse_id")) != str(warehouse_id):
                 continue
@@ -74,9 +99,9 @@ def list_bins_in_warehouse_dynamic(warehouse_id: str,
         if bins:
             return bins
     except Exception:
-        pass  # fall back to env var
+        pass
 
-    # Fallback: define SRC_BINS in Render env (e.g. "101,102,103")
+    # Fallback to env var
     csv = os.environ.get("SRC_BINS", "")
     bins = [s.strip() for s in csv.split(",") if s.strip().isdigit()]
     bins = [b for b in bins if b != str(dst_id) and b not in exclude_ids]
@@ -86,16 +111,16 @@ def list_bins_in_warehouse_dynamic(warehouse_id: str,
 def transfer_order_qty():
     """
     Create stock transfer document(s) moving ORDERED QTY ONLY
-    from one or more source bins -> destination bin for all items on the order
-    (within WAREHOUSE_ID).
+    from one or more source bins -> destination bin for all items on the order (warehouse WAREHOUSE_ID).
 
     Query:
       - order_id OR order_number
       - src: comma-separated bin IDs or 'all'
-      - dst: destination bin ID (Internal Stock bin)
+      - dst: destination bin ID (e.g., your Internal Stock bin)
       - exclude (optional): comma-separated bin IDs to skip
       - key: shared secret
     """
+    # Auth
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         abort(401, "Unauthorized: key mismatch")
@@ -131,13 +156,15 @@ def transfer_order_qty():
     order = orders[0]
     items = order.get("products", []) or []
 
-    # Prepare lines (resolve product_id by SKU if needed)
-    order_lines = []
+    # Prepare order lines (resolve product_id by SKU if needed)
+    order_lines: List[Dict[str, Any]] = []
     any_pid_for_inv_lookup: Optional[str] = None
     for it in items:
         qty = it.get("quantity") or it.get("qty") or 0
-        try: qty = int(qty)
-        except Exception: qty = 0
+        try:
+            qty = int(qty)
+        except Exception:
+            qty = 0
         if qty <= 0:
             continue
 
@@ -145,7 +172,10 @@ def transfer_order_qty():
         if not pid:
             sku = it.get("sku")
             if sku:
-                lookup = bl_call("getInventoryProductsData", {"filter_sku": [sku]})
+                lookup = bl_call("getInventoryProductsData", {
+                    "filter_sku": [sku],
+                    "include": ["inventory_id"]  # request inventory_id here too
+                })
                 prods = lookup.get("products", [])
                 if prods and prods[0].get("product_id"):
                     pid = str(prods[0]["product_id"])
@@ -158,6 +188,7 @@ def transfer_order_qty():
     if not order_lines:
         abort(400, "No transferrable items found on this order (no product_ids/quantities)")
 
+    # Get inventory_id once (needed for the document calls)
     inv_id = get_inventory_id_for_any_product(any_pid_for_inv_lookup)
 
     total_moved = 0
@@ -165,6 +196,7 @@ def transfer_order_qty():
 
     # Sweep through source bins; create one transfer doc per source bin
     for src_loc_id in src_bins:
+        # Build a doc for what's still needed
         products_for_this_bin = []
         for line in order_lines:
             need = line["qty_needed"]
@@ -201,7 +233,7 @@ def transfer_order_qty():
             if all(l["qty_needed"] <= 0 for l in order_lines):
                 break
         except Exception:
-            # If rejected (e.g., not enough in this bin), we skip and continue to next bin.
+            # If BL rejects (e.g., insufficient stock in this bin), skip to next bin
             continue
 
     remaining = sum(l["qty_needed"] for l in order_lines)
