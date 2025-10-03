@@ -8,10 +8,13 @@ BL_API_URL = "https://api.baselinker.com/connector.php"
 BL_TOKEN   = os.environ.get("BL_TOKEN")
 SHARED_KEY = os.environ.get("BL_SHARED_KEY", "")
 
-WAREHOUSE_ID = "77617"
-TIMEOUT      = 30  # seconds
-FALLBACK_INVENTORY_ID = os.environ.get("INVENTORY_ID", "")
-SRC_BINS_ENV = os.environ.get("SRC_BINS", "")
+# Your setup
+WAREHOUSE_ID = "77617"  # your warehouse id
+TIMEOUT      = 30       # seconds
+
+# Fallbacks / env
+FALLBACK_INVENTORY_ID = os.environ.get("INVENTORY_ID", "")  # set in Render
+SRC_BINS_ENV = os.environ.get("SRC_BINS", "")               # optional CSV list
 
 app = Flask(__name__)
 
@@ -112,17 +115,51 @@ def get_order_by_id_strict(order_id: str) -> dict:
     raise LookupError(f"Order not found by order_id {oid}")
 
 # ---------- inventory helpers ----------
+def discover_inventory_id() -> Optional[str]:
+    """
+    Try to discover a usable inventory_id.
+    Priority:
+      1) Return the inventory_id of WAREHOUSE_ID if present.
+      2) Otherwise return the first warehouse's inventory_id.
+      3) Otherwise None.
+    """
+    try:
+        resp = bl_call("getInventoryWarehouses", {})
+        warehouses = resp.get("warehouses", []) or []
+        for wh in warehouses:
+            if str(wh.get("warehouse_id")) == str(WAREHOUSE_ID) and wh.get("inventory_id"):
+                return str(wh.get("inventory_id"))
+        for wh in warehouses:
+            if wh.get("inventory_id"):
+                return str(wh.get("inventory_id"))
+    except Exception:
+        pass
+    return None
+
 def get_inventory_id_for_any_product(product_id: str) -> str:
-    inv = bl_call("getInventoryProductsData", {
-        "filter_ids": [product_id],
-        "include": ["inventory_id"]
-    })
-    prods = inv.get("products", [])
-    if prods and prods[0].get("inventory_id"):
-        return str(prods[0]["inventory_id"])
+    # First, try to read from the product (some accounts return it)
+    try:
+        inv = bl_call("getInventoryProductsData", {
+            "filter_ids": [product_id],
+            "include": ["inventory_id"]
+        })
+        prods = inv.get("products", []) or []
+        if prods and prods[0].get("inventory_id"):
+            return str(prods[0]["inventory_id"])
+    except Exception:
+        pass
+
+    # Next, if an env fallback is set, use it
     if FALLBACK_INVENTORY_ID:
         return FALLBACK_INVENTORY_ID
-    raise LookupError(f"Inventory product {product_id} missing inventory_id")
+
+    # Finally, try to discover from warehouses
+    disc = discover_inventory_id()
+    if disc:
+        return disc
+
+    # Give a clear error if nothing found
+    raise LookupError("Could not determine inventory_id. Set INVENTORY_ID env var or ensure getInventoryWarehouses returns one.")
 
 def lookup_inventory_by_sku(sku: str) -> Optional[Dict[str, Any]]:
     if not sku:
@@ -293,6 +330,7 @@ def transfer_order_qty():
 
         total_moved = 0
         per_bin_docs = 0
+        created_ids: List[str] = []
 
         for src_loc_id in src_bins:
             products_for_this_bin = []
@@ -319,13 +357,21 @@ def transfer_order_qty():
             }
 
             try:
-                _ = bl_call("addInventoryStockDocument", doc_params)
+                resp_doc = bl_call("addInventoryStockDocument", doc_params)
+                doc_id = str((resp_doc or {}).get("document_id", "")).strip()
+                if not doc_id:
+                    # Treat as failure if BL didn't return a document id
+                    continue
+                created_ids.append(doc_id)
+
+                # Decrement remaining quantities
                 for p in products_for_this_bin:
                     for line in order_lines:
                         if line["product_id"] == p["product_id"] and line["qty_needed"] > 0:
                             moved = min(line["qty_needed"], int(p["quantity"]))
                             line["qty_needed"] -= moved
                             total_moved += moved
+
                 per_bin_docs += 1
                 if all(l["qty_needed"] <= 0 for l in order_lines):
                     break
@@ -339,12 +385,13 @@ def transfer_order_qty():
             "message": f"Created {per_bin_docs} transfer document(s) into bin {dst_loc_id} in warehouse {WAREHOUSE_ID}.",
             "moved_units": total_moved,
             "remaining_not_moved": remaining,
-            "order_id": order_id
+            "order_id": order_id,
+            "document_ids": created_ids
         })
     except Exception as e:
         return http_error(500, "Internal error", detail=f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}")
 
-# ---------- debug endpoints ----------
+# ---------- debug / troubleshooting ----------
 @app.get("/bl/debug_order")
 def debug_order():
     try:
@@ -462,6 +509,46 @@ def recent_orders():
         return jsonify({"count": len(results), "orders": results})
     except Exception as e:
         return http_error(500, "Internal error", detail=f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}")
+
+@app.get("/bl/check_product")
+def check_product():
+    """Inspect a product's basic info and its inventory_id."""
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized: key mismatch")
+    pid = (request.args.get("pid") or "").strip()
+    if not pid:
+        return http_error(400, "Provide pid")
+    try:
+        resp = bl_call("getInventoryProductsData", {
+            "filter_ids": [pid],
+            "include": ["inventory_id", "sku", "ean", "name"]
+        })
+        prods = resp.get("products", []) or []
+        if not prods:
+            return http_error(404, f"Product {pid} not found")
+        p = prods[0]
+        return jsonify({
+            "product_id": str(p.get("product_id")),
+            "name": p.get("name"),
+            "sku": p.get("sku"),
+            "ean": p.get("ean"),
+            "inventory_id": str(p.get("inventory_id"))
+        })
+    except Exception as e:
+        return http_error(500, "Internal error", detail=str(e))
+
+@app.get("/bl/warehouses")
+def warehouses_info():
+    """Dump warehouses with inventory_id and locations to confirm bin/warehouse/inventory mapping."""
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized: key mismatch")
+    try:
+        resp = bl_call("getInventoryWarehouses", {})
+        return jsonify(resp)
+    except Exception as e:
+        return http_error(500, "Internal error", detail=str(e))
 
 @app.get("/health")
 def health():
