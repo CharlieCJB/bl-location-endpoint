@@ -1,4 +1,4 @@
-# app.py — BaseLinker catalog stock + storage documents (IGI + IGR for intra-warehouse relocation)
+# app.py — BaseLinker catalog stock: relocate ordered qty via IGI + IGR (supports multiple source bins)
 import os, json, time, traceback
 from typing import Optional, List, Dict, Any
 from flask import Flask, request, jsonify, make_response
@@ -9,13 +9,13 @@ BL_TOKEN   = os.environ.get("BL_TOKEN")
 SHARED_KEY = os.environ.get("BL_SHARED_KEY", "")
 
 # ---- YOUR SETUP ----
-WAREHOUSE_ID = "77617"                               # your warehouse id
-CATALOG_ID   = os.environ.get("INVENTORY_ID")        # BaseLinker catalog (inventory_id) — REQUIRED, numeric
+WAREHOUSE_ID = "77617"                         # your warehouse id
+CATALOG_ID   = os.environ.get("INVENTORY_ID")  # BaseLinker catalog (inventory_id) — REQUIRED, numeric
 TIMEOUT      = 30
 
 app = Flask(__name__)
 
-# -------------------- helpers --------------------
+# ---------------- helpers ----------------
 def http_error(status: int, msg: str, detail: str = ""):
     payload = {"error": msg}
     if detail:
@@ -47,7 +47,7 @@ def require_catalog_id() -> int:
     except:
         raise RuntimeError("INVENTORY_ID must be numeric (your BaseLinker catalog id).")
 
-# -------------------- orders ---------------------
+# ---------------- orders ----------------
 def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
     if order_id:
         return str(order_id).strip()
@@ -91,7 +91,7 @@ def get_order_by_id_strict(order_id: str) -> dict:
         page += 1
     raise LookupError(f"Order not found by order_id {oid}")
 
-# ----- catalog product lookup (by SKU/EAN) -----
+# -------- catalog product lookup (by SKU/EAN) --------
 def find_catalog_product_id_by_sku(sku: str) -> Optional[int]:
     inv_id = require_catalog_id()
     if not sku: return None
@@ -122,10 +122,11 @@ def resolve_catalog_product_id_from_order_item(it: Dict[str, Any]) -> Optional[i
     pid = find_catalog_product_id_by_ean(ean) if ean else None
     return pid
 
-# ------------- warehouse / bin helpers -------------
+# -------- warehouse / bin helpers --------
 def get_location_name_by_id(location_id: str) -> Optional[str]:
     """Map numeric location_id -> location_name. Try locations endpoint first, then warehouses."""
     loc_id = str(location_id).strip()
+    # Preferred: explicit locations
     try:
         resp = bl_call("getInventoryLocations", {"warehouse_id": int(WAREHOUSE_ID)})
         for loc in (resp.get("locations") or []):
@@ -133,6 +134,7 @@ def get_location_name_by_id(location_id: str) -> Optional[str]:
                 return (loc.get("name") or "").strip()
     except Exception:
         pass
+    # Fallback: nested in warehouses
     try:
         resp = bl_call("getInventoryWarehouses", {})
         for wh in (resp.get("warehouses") or []):
@@ -152,8 +154,7 @@ def create_document(document_type: int, warehouse_id: int) -> int:
     document_type:
       1 = IGR (Internal Goods Receipt)
       3 = IGI (Internal Goods Issue)
-      2 = GI  (Goods Issue)        # not used here
-      4 = IT  (Internal Transfer)  # requires different source & target warehouses
+      4 = IT  (Internal Transfer)  # requires different source/target warehouses; not used here
     """
     inv_id = require_catalog_id()
     payload = {
@@ -180,16 +181,23 @@ def add_items_to_document(document_id: int, lines: List[Dict[str, Any]]) -> List
 def confirm_document(document_id: int) -> None:
     bl_call("setInventoryDocumentStatusConfirmed", {"document_id": int(document_id)})
 
-# -------------------- core endpoint --------------------
+# ---------------- core endpoint ----------------
 @app.get("/bl/transfer_order_qty_catalog")
 def transfer_order_qty_catalog():
     """
     Relocate ONLY the ordered qty inside the SAME warehouse via two documents:
-      1) IGI (3) — issue from warehouse (decrease)
-      2) IGR (1) — receipt into destination location (increase)
-    Destination can be provided as:
-      - dst (numeric location_id), or
-      - dst_name (string location name)
+      1) IGI (3) — issue from specified source bin(s)
+      2) IGR (1) — receipt into destination bin
+
+    Params:
+      - order_id or order_number (one required)
+      - dst (location_id) OR dst_name (location name)  -> destination bin
+      - src_name (single source bin name) OR src_names=CSV (multiple source bin names)
+        -> required in strict control to ensure IGI removes from real bins
+
+    Strategy for multiple sources:
+      - For each product line, split the ordered qty evenly across all src_names.
+      - This is robust across many SKUs when per-bin availability isn't accessible via API.
     """
     try:
         supplied = request.args.get("key") or request.headers.get("X-App-Key")
@@ -198,8 +206,16 @@ def transfer_order_qty_catalog():
 
         order_id_param = (request.args.get("order_id") or "").strip() or None
         order_number   = (request.args.get("order_number") or "").strip() or None
+
         dst_loc_id     = (request.args.get("dst") or "").strip()
         dst_name       = (request.args.get("dst_name") or "").strip()
+
+        src_name   = (request.args.get("src_name") or "").strip()
+        src_names  = (request.args.get("src_names") or "").strip()
+        src_list = [s.strip() for s in src_names.split(",") if s.strip()] if src_names else ([src_name] if src_name else [])
+
+        if not src_list:
+            return http_error(400, "Please specify source bin(s): use src_name=<bin> or src_names=BinA,BinB.")
 
         # Resolve order & items
         order_id = resolve_order_id(order_id_param, order_number)
@@ -208,16 +224,19 @@ def transfer_order_qty_catalog():
         if not items:
             return http_error(400, "Order has no products")
 
-        # Resolve destination location_name
-        loc_name = dst_name or (get_location_name_by_id(dst_loc_id) if dst_loc_id else None)
+        # Destination: resolve to location_name
+        loc_name = None
+        if dst_name:
+            loc_name = dst_name
+        elif dst_loc_id:
+            loc_name = get_location_name_by_id(dst_loc_id)
         if not loc_name:
             return http_error(400,
-                "Destination not found. Pass a valid numeric 'dst' (location_id) or 'dst_name'. "
-                "Tip: use the exact location name as in BaseLinker."
+                "Destination not found. Pass a valid numeric 'dst' (location_id) or 'dst_name' (location name)."
             )
 
-        # Build lines (catalog product_id + ordered qty)
-        missing, lines = [], []
+        # Build product list (catalog product_id + ordered qty)
+        missing, base_lines = [], []
         for it in items:
             qty = it.get("quantity") or it.get("qty") or 0
             try: qty = int(qty)
@@ -231,30 +250,49 @@ def transfer_order_qty_catalog():
                     "ean": (it.get("ean") or it.get("product_ean") or "").strip()
                 })
                 continue
-            lines.append({
-                "product_id": pid,
-                "quantity": qty
-                # IGI lines: no location_name (decrease from warehouse pool)
-            })
+            base_lines.append({"product_id": pid, "quantity": qty})
 
-        if not lines:
+        if not base_lines:
             return http_error(400, f"No transferrable items (catalog product_id match not found). Missing: {missing}")
 
-        # 1) IGI: decrease from warehouse (no location_name)
+        # -------- IGI: issue from source bins (even split per product) --------
         igi_id = create_document(document_type=3, warehouse_id=int(WAREHOUSE_ID))  # IGI
-        _igi_items = add_items_to_document(igi_id, lines)
+        igi_lines: List[Dict[str, Any]] = []
+
+        for l in base_lines:
+            qty = int(l["quantity"])
+            n = max(1, len(src_list))
+            # Even split; remainder goes to last bin
+            per = max(1, qty // n)
+            remaining = qty
+            for i, src in enumerate(src_list):
+                take = per if i < n - 1 else remaining
+                if take <= 0: 
+                    continue
+                igi_lines.append({
+                    "product_id": l["product_id"],
+                    "quantity": take,
+                    "location_name": src  # consume from this bin
+                })
+                remaining -= take
+
+        igi_item_ids = add_items_to_document(igi_id, igi_lines)
+        if not igi_item_ids:
+            return http_error(400, "IGI failed to add any items. Check source bin names and that those bins have stock.")
         confirm_document(igi_id)
 
-        # 2) IGR: increase into destination location_name
+        # -------- IGR: receipt into destination bin --------
+        igr_id = create_document(document_type=1, warehouse_id=int(WAREHOUSE_ID))  # IGR
         igr_lines = []
-        for l in lines:
+        for l in base_lines:
             igr_lines.append({
                 "product_id": l["product_id"],
                 "quantity": l["quantity"],
-                "location_name": loc_name  # put into the target bin
+                "location_name": loc_name
             })
-        igr_id = create_document(document_type=1, warehouse_id=int(WAREHOUSE_ID))  # IGR
-        _igr_items = add_items_to_document(igr_id, igr_lines)
+        igr_item_ids = add_items_to_document(igr_id, igr_lines)
+        if not igr_item_ids:
+            return http_error(400, "IGR failed to add items. Check destination bin name.")
         confirm_document(igr_id)
 
         return jsonify({
@@ -262,9 +300,11 @@ def transfer_order_qty_catalog():
             "message": f"Relocated ordered qty for order {order_id} into '{loc_name}' using IGI+IGR.",
             "igi_document_id": igi_id,
             "igr_document_id": igr_id,
-            "moved_units": sum(l["quantity"] for l in lines),
-            "missing": missing
+            "moved_units": sum(l["quantity"] for l in base_lines),
+            "missing": missing,
+            "sources_used": src_list
         })
+
     except Exception as e:
         return http_error(500, "Internal error", detail=f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}")
 
@@ -296,7 +336,7 @@ def recent_orders():
             page += 1
         return jsonify({"count": len(results), "orders": results})
     except Exception as e:
-        return http_error(500, "Internal error", detail=str(e))
+        return http_error(500, "Internal error", detail:str(e))
 
 @app.get("/bl/find_order")
 def find_order():
@@ -332,10 +372,11 @@ def find_order():
         } for o in matches]
         return jsonify({"count": len(out), "matches": out})
     except Exception as e:
-        return http_error(500, "Internal error", detail=str(e))
+        return http_error(500, "Internal error", detail:str(e))
 
 @app.get("/bl/locations")
 def list_locations():
+    """Try to enumerate locations (may be empty in catalog mode)."""
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         return http_error(401, "Unauthorized")
@@ -355,18 +396,7 @@ def list_locations():
                 break
         return jsonify(out)
     except Exception as e:
-        return http_error(500, "Internal error", detail=str(e))
-
-@app.get("/bl/inventories")
-def list_inventories():
-    supplied = request.args.get("key") or request.headers.get("X-App-Key")
-    if SHARED_KEY and supplied != SHARED_KEY:
-        return http_error(401, "Unauthorized")
-    try:
-        resp = bl_call("getInventories", {})
-        return jsonify(resp)
-    except Exception as e:
-        return http_error(500, "Internal error", detail=str(e))
+        return http_error(500, "Internal error", detail:str(e))
 
 @app.get("/health")
 def health():
