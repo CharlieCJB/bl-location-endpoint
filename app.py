@@ -1,7 +1,7 @@
 # app.py
 import os, json, time, traceback
 from typing import Optional, List, Dict, Any
-from flask import Flask, request, abort, jsonify, make_response
+from flask import Flask, request, jsonify, make_response
 import requests
 
 BL_API_URL = "https://api.baselinker.com/connector.php"
@@ -16,7 +16,6 @@ SRC_BINS_ENV = os.environ.get("SRC_BINS", "")
 app = Flask(__name__)
 
 # ---------- utils ----------
-
 def http_error(status: int, msg: str, detail: str = ""):
     payload = {"error": msg}
     if detail:
@@ -35,13 +34,21 @@ def bl_call(method: str, params: dict) -> dict:
         raise RuntimeError(f"BaseLinker API error in {method}: {j['error']}")
     return j
 
-# ---------- order lookup ----------
+def to_int(x) -> int:
+    try:
+        return int(x or 0)
+    except Exception:
+        return 0
 
+# ---------- order lookup (client-side; also matches by ID when number is None) ----------
 def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
     """
-    Prefer order_id. If only order_number is provided:
-      - Try direct getOrders(order_number=...) but verify exact match and pick most recent.
-      - Fallback: paged scans by creation time (date_from), verify exact matches.
+    Prefer order_id (fast).
+    If only order_number is provided, do a robust client-side scan of recent orders,
+    and consider a match if:
+      - order.order_number == provided value (exact), OR
+      - order.order_number is empty/None AND order.order_id == provided value (manual orders).
+    Return the most recent match by (date_add, date_confirmed, order_id).
     """
     if order_id:
         return str(order_id).strip()
@@ -50,65 +57,29 @@ def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> st
 
     needle = str(order_number).strip()
 
-    def pick_most_recent(matches: List[dict]) -> Optional[str]:
-        if not matches:
-            return None
-        def keyfn(o):
-            # robust: coerce to int safely
-            def to_i(x): 
-                try: return int(x or 0)
-                except: return 0
-            return (to_i(o.get("date_add")), to_i(o.get("date_confirmed")), to_i(o.get("order_id")))
-        return str(sorted(matches, key=keyfn, reverse=True)[0].get("order_id"))
+    # Robust scan: last 60 days, up to 300 pages (safety caps)
+    date_from = int(time.time()) - 60 * 24 * 60 * 60
+    matches: List[dict] = []
+    page = 1
+    while page <= 300:
+        resp = bl_call("getOrders", {"date_from": date_from, "get_unconfirmed_orders": True, "page": page})
+        rows = resp.get("orders", []) or []
+        if not rows:
+            break
+        for o in rows:
+            o_num = str(o.get("order_number", "")).strip()
+            o_id  = str(o.get("order_id", "")).strip()
+            if (o_num and o_num == needle) or (not o_num and o_id == needle):
+                matches.append(o)
+        page += 1
 
-    # 1) Direct param (verify matches)
-    try:
-        resp = bl_call("getOrders", {
-            "order_number": needle,
-            "get_unconfirmed_orders": True
-        })
-        orders = resp.get("orders", []) or []
-        exact = [o for o in orders if str(o.get("order_number", "")).strip() == needle]
-        chosen = pick_most_recent(exact)
-        if chosen:
-            return chosen
-    except Exception:
-        pass  # fall through
+    if not matches:
+        raise LookupError(f"Order with order_number/id '{order_number}' not found")
 
-    # 2) Paged scan helper
-    def paged_scan(date_from_ts: int, pages_max: int = 200) -> Optional[str]:
-        page = 1
-        matches: List[dict] = []
-        while page <= pages_max:
-            params = {
-                "date_from": date_from_ts,
-                "get_unconfirmed_orders": True,
-                "page": page
-            }
-            resp = bl_call("getOrders", params)
-            rows = resp.get("orders", []) or []
-            if not rows:
-                break
-            for o in rows:
-                if str(o.get("order_number", "")).strip() == needle:
-                    matches.append(o)
-            page += 1
-        return pick_most_recent(matches)
-
-    # 3) Broad scan 365d, then 1d
-    date_from = int(time.time()) - 365 * 24 * 60 * 60
-    found = paged_scan(date_from, 200)
-    if found:
-        return found
-    one_day_ago = int(time.time()) - 1 * 24 * 60 * 60
-    found = paged_scan(one_day_ago, 50)
-    if found:
-        return found
-
-    raise LookupError(f"Order with order_number '{order_number}' not found")
+    matches.sort(key=lambda o: (to_int(o.get("date_add")), to_int(o.get("date_confirmed")), to_int(o.get("order_id"))), reverse=True)
+    return str(matches[0].get("order_id"))
 
 # ---------- inventory helpers ----------
-
 def get_inventory_id_for_any_product(product_id: str) -> str:
     inv = bl_call("getInventoryProductsData", {
         "filter_ids": [product_id],
@@ -187,10 +158,10 @@ def resolve_inventory_pid_from_order_item(it: Dict[str, Any]) -> Optional[str]:
     return None
 
 # ---------- bin discovery ----------
-
 def list_bins_in_warehouse_dynamic(warehouse_id: str,
                                    exclude_ids: set[str],
                                    dst_id: str) -> List[str]:
+    # Try dedicated locations endpoint
     try:
         resp = bl_call("getInventoryLocations", {"warehouse_id": warehouse_id})
         bins: List[str] = []
@@ -205,6 +176,7 @@ def list_bins_in_warehouse_dynamic(warehouse_id: str,
             return bins
     except Exception:
         pass
+    # Try nested locations in warehouses
     try:
         resp = bl_call("getInventoryWarehouses", {})
         bins = []
@@ -222,13 +194,13 @@ def list_bins_in_warehouse_dynamic(warehouse_id: str,
             return bins
     except Exception:
         pass
+    # Fallback to env var
     csv = SRC_BINS_ENV
     bins = [s.strip() for s in csv.split(",") if s.strip().isdigit()]
     bins = [b for b in bins if b != str(dst_id) and b not in exclude_ids]
     return bins
 
 # ---------- core: transfer ordered qty ----------
-
 @app.get("/bl/transfer_order_qty")
 def transfer_order_qty():
     try:
@@ -327,7 +299,6 @@ def transfer_order_qty():
                 if all(l["qty_needed"] <= 0 for l in order_lines):
                     break
             except Exception:
-                # skip this bin and continue
                 continue
 
         remaining = sum(l["qty_needed"] for l in order_lines)
@@ -342,7 +313,6 @@ def transfer_order_qty():
         return http_error(500, "Internal error", detail=f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}")
 
 # ---------- debug endpoints ----------
-
 @app.get("/bl/debug_order")
 def debug_order():
     try:
@@ -382,7 +352,7 @@ def debug_order():
 
 @app.get("/bl/find_order")
 def find_order():
-    """Search by order_number and return all matches (verified) with dates to disambiguate."""
+    """Client-side scan by provided value; matches order_number OR (when None) order_id."""
     try:
         supplied = request.args.get("key") or request.headers.get("X-App-Key")
         if SHARED_KEY and supplied != SHARED_KEY:
@@ -393,43 +363,33 @@ def find_order():
             return http_error(400, "Provide order_number")
         needle = order_number
 
-        # try direct
-        matches: List[dict] = []
-        try:
-            resp = bl_call("getOrders", {"order_number": needle, "get_unconfirmed_orders": True})
-            for o in resp.get("orders", []) or []:
-                if str(o.get("order_number", "")).strip() == needle:
-                    matches.append(o)
-        except Exception:
-            pass
+        days = int(request.args.get("days", "60"))
+        date_from = int(time.time()) - max(1, days) * 24 * 60 * 60
 
-        # plus a short recent scan
-        date_from = int(time.time()) - 30 * 24 * 60 * 60
+        matches: List[dict] = []
         page = 1
-        while page <= 50 and len(matches) < 10:
+        while page <= 300 and len(matches) < 200:
             resp = bl_call("getOrders", {"date_from": date_from, "get_unconfirmed_orders": True, "page": page})
             rows = resp.get("orders", []) or []
             if not rows:
                 break
             for o in rows:
-                if str(o.get("order_number", "")).strip() == needle:
+                o_num = str(o.get("order_number", "")).strip()
+                o_id  = str(o.get("order_id", "")).strip()
+                if (o_num and o_num == needle) or (not o_num and o_id == needle):
                     matches.append(o)
             page += 1
 
-        # format output
-        out = []
-        for o in matches:
-            def to_i(x):
-                try: return int(x or 0)
-                except: return 0
-            out.append({
-                "order_id": str(o.get("order_id")),
-                "order_number": str(o.get("order_number")),
-                "date_add": to_i(o.get("date_add")),
-                "date_confirmed": to_i(o.get("date_confirmed")),
-                "status_id": o.get("status_id"),
-                "shop_id": o.get("shop_id"),
-            })
+        matches.sort(key=lambda o: (to_int(o.get("date_add")), to_int(o.get("date_confirmed")), to_int(o.get("order_id"))), reverse=True)
+
+        out = [{
+            "order_id": str(o.get("order_id")),
+            "order_number": str(o.get("order_number")),
+            "date_add": to_int(o.get("date_add")),
+            "date_confirmed": to_int(o.get("date_confirmed")),
+            "status_id": o.get("status_id"),
+            "shop_id": o.get("shop_id"),
+        } for o in matches]
 
         return jsonify({"count": len(out), "matches": out})
     except Exception as e:
@@ -457,14 +417,11 @@ def recent_orders():
             for o in rows:
                 if len(results) >= limit:
                     break
-                def to_i(x):
-                    try: return int(x or 0)
-                    except: return 0
                 results.append({
                     "order_id": str(o.get("order_id")),
                     "order_number": str(o.get("order_number")),
-                    "date_add": to_i(o.get("date_add")),
-                    "date_confirmed": to_i(o.get("date_confirmed")),
+                    "date_add": to_int(o.get("date_add")),
+                    "date_confirmed": to_int(o.get("date_confirmed")),
                     "status_id": o.get("status_id"),
                     "shop_id": o.get("shop_id"),
                 })
