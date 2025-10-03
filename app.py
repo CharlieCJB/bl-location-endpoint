@@ -40,7 +40,7 @@ def to_int(x) -> int:
     except Exception:
         return 0
 
-# ---------- order lookup (client-side; also matches by ID when number is None) ----------
+# ---------- order lookup ----------
 def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
     """
     Prefer order_id (fast).
@@ -78,6 +78,38 @@ def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> st
 
     matches.sort(key=lambda o: (to_int(o.get("date_add")), to_int(o.get("date_confirmed")), to_int(o.get("order_id"))), reverse=True)
     return str(matches[0].get("order_id"))
+
+def get_order_by_id_strict(order_id: str) -> dict:
+    """
+    Return a single order dict by order_id.
+    Tries direct fetch (incl. unconfirmed), then falls back to a client-side scan.
+    Raises LookupError if not found.
+    """
+    oid = str(order_id).strip()
+
+    # Try direct fetch (include unconfirmed)
+    try:
+        resp = bl_call("getOrders", {"order_id": oid, "get_unconfirmed_orders": True})
+        orders = resp.get("orders", []) or []
+        if orders:
+            return orders[0]
+    except Exception:
+        pass
+
+    # Fallback: scan last 60 days, client-side match by order_id
+    date_from = int(time.time()) - 60 * 24 * 60 * 60
+    page = 1
+    while page <= 300:
+        resp = bl_call("getOrders", {"date_from": date_from, "get_unconfirmed_orders": True, "page": page})
+        rows = resp.get("orders", []) or []
+        if not rows:
+            break
+        for o in rows:
+            if str(o.get("order_id", "")).strip() == oid:
+                return o
+        page += 1
+
+    raise LookupError(f"Order not found by order_id {oid}")
 
 # ---------- inventory helpers ----------
 def get_inventory_id_for_any_product(product_id: str) -> str:
@@ -228,13 +260,13 @@ def transfer_order_qty():
             if not src_bins:
                 return http_error(400, "No valid numeric source bin IDs in 'src'")
 
+        # Resolve to order_id, then fetch strict
         order_id = resolve_order_id(order_id_param, order_number)
+        try:
+            order = get_order_by_id_strict(order_id)
+        except LookupError as e:
+            return http_error(404, str(e))
 
-        o = bl_call("getOrders", {"order_id": order_id})
-        orders = o.get("orders", [])
-        if not orders:
-            return http_error(404, "Order not found by order_id")
-        order = orders[0]
         items = order.get("products", []) or []
 
         order_lines: List[Dict[str, Any]] = []
@@ -299,6 +331,7 @@ def transfer_order_qty():
                 if all(l["qty_needed"] <= 0 for l in order_lines):
                     break
             except Exception:
+                # skip this bin and continue
                 continue
 
         remaining = sum(l["qty_needed"] for l in order_lines)
@@ -324,11 +357,11 @@ def debug_order():
         order_number   = (request.args.get("order_number") or "").strip() or None
         order_id = resolve_order_id(order_id_param, order_number)
 
-        o = bl_call("getOrders", {"order_id": order_id})
-        orders = o.get("orders", [])
-        if not orders:
-            return http_error(404, "Order not found by order_id")
-        order = orders[0]
+        try:
+            order = get_order_by_id_strict(order_id)
+        except LookupError as e:
+            return http_error(404, str(e))
+
         items = order.get("products", []) or []
 
         out = []
