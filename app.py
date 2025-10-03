@@ -31,39 +31,65 @@ def bl_call(method: str, params: dict) -> dict:
 
 def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
     """
-    Prefer order_id (fast). If only order_number is provided, search recent orders
-    by creation time (date_from) so very new/unconfirmed orders are included.
-    Includes simple pagination if your account returns a next page token/index.
+    Prefer order_id (fast). If only order_number is provided:
+      1) Try direct filter by order_number (fast path if supported).
+      2) Fallback: scan by creation time (date_from) with pagination and include unconfirmed orders.
+      3) Final fallback: a very-recent 1-day scan (in case of window caps).
     """
     if order_id:
         return str(order_id)
     if not order_number:
         abort(400, "Provide order_id or order_number")
 
-    date_from = int(time.time()) - 365 * 24 * 60 * 60
-    page_token = None
-    while True:
-        params = {
-            "date_from": date_from,
-            "get_unconfirmed_orders": True,
-        }
-        if page_token:
-            params["page"] = page_token
-        resp = bl_call("getOrders", params)
-        for o in resp.get("orders", []):
-            if str(o.get("order_number", "")).strip() == str(order_number).strip():
-                return str(o.get("order_id"))
-        page_token = resp.get("next_page") or resp.get("page_next") or None
-        if not page_token:
-            break
+    # --- 1) Try direct lookup by order_number ---
+    try:
+        resp = bl_call("getOrders", {
+            "order_number": str(order_number).strip(),
+            "get_unconfirmed_orders": True
+        })
+        orders = resp.get("orders", []) or []
+        if orders:
+            return str(orders[0].get("order_id"))
+    except Exception:
+        pass
 
-    abort(404, f"Order with order_number '{order_number}' not found in last 365 days")
+    # Helper: paged scan
+    def paged_scan(date_from_ts: int, pages_max: int = 200) -> Optional[str]:
+        page = 1
+        while page <= pages_max:
+            params = {
+                "date_from": date_from_ts,
+                "get_unconfirmed_orders": True,
+                "page": page
+            }
+            resp = bl_call("getOrders", params)
+            for o in resp.get("orders", []) or []:
+                if str(o.get("order_number", "")).strip() == str(order_number).strip():
+                    return str(o.get("order_id"))
+            if not resp.get("orders"):
+                break
+            page += 1
+        return None
+
+    # --- 2) Broad scan: last 365 days ---
+    date_from = int(time.time()) - 365 * 24 * 60 * 60
+    found = paged_scan(date_from_ts=date_from, pages_max=200)
+    if found:
+        return found
+
+    # --- 3) Very recent scan: last 1 day ---
+    one_day_ago = int(time.time()) - 1 * 24 * 60 * 60
+    found = paged_scan(date_from_ts=one_day_ago, pages_max=50)
+    if found:
+        return found
+
+    abort(404, f"Order with order_number '{order_number}' not found in recent history")
 
 def get_inventory_id_for_any_product(product_id: str) -> str:
     """Fetch inventory_id for an inventory product; fallback to env if missing."""
     inv = bl_call("getInventoryProductsData", {
         "filter_ids": [product_id],
-        "include": ["inventory_id"]   # explicitly request it
+        "include": ["inventory_id"]
     })
     prods = inv.get("products", [])
     if prods and prods[0].get("inventory_id"):
@@ -79,7 +105,7 @@ def list_bins_in_warehouse_dynamic(warehouse_id: str,
     Discover all bin/location IDs for a warehouse via API; fallback to SRC_BINS env var.
     Excludes dst_id and anything in exclude_ids.
     """
-    # Try a dedicated locations endpoint first (if available)
+    # Try dedicated locations endpoint
     try:
         resp = bl_call("getInventoryLocations", {"warehouse_id": warehouse_id})
         bins: List[str] = []
@@ -95,7 +121,7 @@ def list_bins_in_warehouse_dynamic(warehouse_id: str,
     except Exception:
         pass
 
-    # Try nested locations inside warehouses
+    # Try nested in warehouses
     try:
         resp = bl_call("getInventoryWarehouses", {})
         bins = []
@@ -124,16 +150,8 @@ def list_bins_in_warehouse_dynamic(warehouse_id: str,
 def transfer_order_qty():
     """
     Create stock transfer document(s) moving ORDERED QTY ONLY
-    from one or more source bins -> destination bin for all items on the order (warehouse WAREHOUSE_ID).
-
-    Query:
-      - order_id OR order_number
-      - src: comma-separated bin IDs or 'all'
-      - dst: destination bin ID (e.g., your Internal Stock bin)
-      - exclude (optional): comma-separated bin IDs to skip
-      - key: shared secret
+    from one or more source bins -> destination bin for all items on the order.
     """
-    # Auth
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         abort(401, "Unauthorized: key mismatch")
@@ -158,10 +176,8 @@ def transfer_order_qty():
         if not src_bins:
             abort(400, "No valid numeric source bin IDs in 'src'")
 
-    # Resolve order
     order_id = resolve_order_id(order_id_param, order_number)
 
-    # Fetch order + items
     o = bl_call("getOrders", {"order_id": order_id})
     orders = o.get("orders", [])
     if not orders:
@@ -169,7 +185,6 @@ def transfer_order_qty():
     order = orders[0]
     items = order.get("products", []) or []
 
-    # Prepare order lines (resolve product_id by SKU if needed)
     order_lines: List[Dict[str, Any]] = []
     any_pid_for_inv_lookup: Optional[str] = None
     for it in items:
@@ -187,7 +202,7 @@ def transfer_order_qty():
             if sku:
                 lookup = bl_call("getInventoryProductsData", {
                     "filter_sku": [sku],
-                    "include": ["inventory_id"]  # request inventory_id here too
+                    "include": ["inventory_id"]
                 })
                 prods = lookup.get("products", [])
                 if prods and prods[0].get("product_id"):
@@ -199,17 +214,14 @@ def transfer_order_qty():
                 any_pid_for_inv_lookup = str(pid)
 
     if not order_lines:
-        abort(400, "No transferrable items found on this order (no product_ids/quantities)")
+        abort(400, "No transferrable items found on this order")
 
-    # Get inventory_id once (needed for the document calls)
     inv_id = get_inventory_id_for_any_product(any_pid_for_inv_lookup)
 
     total_moved = 0
     per_bin_docs = 0
 
-    # Sweep through source bins; create one transfer doc per source bin
     for src_loc_id in src_bins:
-        # Build a doc for what's still needed
         products_for_this_bin = []
         for line in order_lines:
             need = line["qty_needed"]
@@ -230,12 +242,11 @@ def transfer_order_qty():
             "source_location_id": src_loc_id,
             "target_location_id": dst_loc_id,
             "products": products_for_this_bin,
-            "comment": f"Auto multi-bin sweep for order {order_id}: {src_loc_id} -> {dst_loc_id}"
+            "comment": f"Auto sweep for order {order_id}: {src_loc_id} -> {dst_loc_id}"
         }
 
         try:
             _ = bl_call("addInventoryStockDocument", doc_params)
-            # Assume requested qty moved; decrement remaining
             for p in products_for_this_bin:
                 for line in order_lines:
                     if line["product_id"] == p["product_id"] and line["qty_needed"] > 0:
@@ -246,7 +257,6 @@ def transfer_order_qty():
             if all(l["qty_needed"] <= 0 for l in order_lines):
                 break
         except Exception:
-            # If BL rejects (e.g., insufficient stock in this bin), skip to next bin
             continue
 
     remaining = sum(l["qty_needed"] for l in order_lines)
