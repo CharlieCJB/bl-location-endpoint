@@ -144,16 +144,6 @@ def lookup_inventory_by_ean(ean: str) -> Optional[Dict[str, Any]]:
     prods = inv.get("products", []) or []
     return prods[0] if prods else None
 
-def validate_inventory_product_id(candidate_pid: str) -> Optional[str]:
-    if not candidate_pid:
-        return None
-    inv = bl_call("getInventoryProductsData", {
-        "filter_ids": [candidate_pid],
-        "include": ["inventory_id"]
-    })
-    prods = inv.get("products", []) or []
-    return str(candidate_pid) if (prods and prods[0].get("inventory_id")) else None
-
 def sku_map_lookup(sku: str) -> Optional[str]:
     raw = os.environ.get("SKU_MAP", "")
     if not raw or not sku:
@@ -166,6 +156,13 @@ def sku_map_lookup(sku: str) -> Optional[str]:
     return table.get(sku.strip())
 
 def resolve_inventory_pid_from_order_item(it: Dict[str, Any]) -> Optional[str]:
+    """
+    Resolve an inventory product_id for a line. Priority:
+      0) SKU_MAP override
+      1) by SKU
+      2) by EAN
+      3) accept any product_id present on the line (NO validation)
+    """
     sku = (it.get("sku") or it.get("product_sku") or "").strip()
     override = sku_map_lookup(sku)
     if override:
@@ -173,20 +170,22 @@ def resolve_inventory_pid_from_order_item(it: Dict[str, Any]) -> Optional[str]:
 
     ean = (it.get("ean") or it.get("product_ean") or "").strip()
 
+    # 1) By SKU
     prod = lookup_inventory_by_sku(sku) if sku else None
     if prod and prod.get("product_id"):
         return str(prod["product_id"])
 
+    # 2) By EAN
     prod = lookup_inventory_by_ean(ean) if ean else None
     if prod and prod.get("product_id"):
         return str(prod["product_id"])
 
+    # 3) Accept any id present on the order line (no validation)
     for key in ("product_id", "storage_product_id", "inventory_product_id"):
         cand = it.get(key)
         if cand:
-            valid = validate_inventory_product_id(str(cand))
-            if valid:
-                return valid
+            return str(cand)
+
     return None
 
 # ---------- bin discovery ----------
