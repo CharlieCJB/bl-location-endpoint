@@ -1,4 +1,4 @@
-# app.py  — BaseLinker catalog stock + storage documents
+# app.py  — BaseLinker catalog stock + storage documents (IT)
 import os, json, time, traceback
 from typing import Optional, List, Dict, Any
 from flask import Flask, request, jsonify, make_response
@@ -9,8 +9,8 @@ BL_TOKEN   = os.environ.get("BL_TOKEN")
 SHARED_KEY = os.environ.get("BL_SHARED_KEY", "")
 
 # ---- YOUR SETUP ----
-WAREHOUSE_ID = "77617"          # your warehouse id
-CATALOG_ID   = os.environ.get("INVENTORY_ID")  # BaseLinker "inventory_id" (catalog id). REQUIRED.
+WAREHOUSE_ID = "77617"                               # your warehouse id
+CATALOG_ID   = os.environ.get("INVENTORY_ID")        # BaseLinker catalog id (a number). REQUIRED.
 TIMEOUT      = 30
 
 app = Flask(__name__)
@@ -101,7 +101,6 @@ def find_catalog_product_id_by_sku(sku: str) -> Optional[int]:
     if not sku: return None
     resp = bl_call("getInventoryProductsList", {"inventory_id": inv_id, "filter_sku": sku})
     prods = resp.get("products", {}) or {}
-    # products is a dict keyed by product_id
     for pid_str, pdata in prods.items():
         if (pdata.get("sku") or "").strip() == sku.strip():
             try: return int(pid_str)
@@ -122,7 +121,6 @@ def find_catalog_product_id_by_ean(ean: str) -> Optional[int]:
 def resolve_catalog_product_id_from_order_item(it: Dict[str, Any]) -> Optional[int]:
     sku = (it.get("sku") or it.get("product_sku") or "").strip()
     ean = (it.get("ean") or it.get("product_ean") or "").strip()
-
     pid = find_catalog_product_id_by_sku(sku) if sku else None
     if pid: return pid
     pid = find_catalog_product_id_by_ean(ean) if ean else None
@@ -130,17 +128,30 @@ def resolve_catalog_product_id_from_order_item(it: Dict[str, Any]) -> Optional[i
 
 # ---------- warehouse / bin helpers ----------
 def get_location_name_by_id(location_id: str) -> Optional[str]:
-    """Map numeric location_id -> human-readable location_name using getInventoryWarehouses."""
-    resp = bl_call("getInventoryWarehouses", {})
-    for wh in (resp.get("warehouses") or []):
-        if str(wh.get("warehouse_id")) != str(WAREHOUSE_ID):
-            continue
-        for loc in (wh.get("locations") or []):
-            if str(loc.get("location_id")) == str(location_id):
+    """Map numeric location_id -> location_name. Try locations endpoint first, then warehouses."""
+    loc_id = str(location_id).strip()
+    # 1) Preferred: getInventoryLocations
+    try:
+        resp = bl_call("getInventoryLocations", {"warehouse_id": int(WAREHOUSE_ID)})
+        for loc in (resp.get("locations") or []):
+            if str(loc.get("location_id")) == loc_id:
                 return (loc.get("name") or "").strip()
+    except Exception:
+        pass
+    # 2) Fallback: getInventoryWarehouses
+    try:
+        resp = bl_call("getInventoryWarehouses", {})
+        for wh in (resp.get("warehouses") or []):
+            if str(wh.get("warehouse_id")) != str(WAREHOUSE_ID):
+                continue
+            for loc in (wh.get("locations") or []):
+                if str(loc.get("location_id")) == loc_id:
+                    return (loc.get("name") or "").strip()
+    except Exception:
+        pass
     return None
 
-# ---------- documents ----------
+# ---------- documents (catalog storage docs) ----------
 def create_transfer_document(warehouse_id: int, target_warehouse_id: int) -> int:
     """Creates an Internal Transfer (IT) document and returns its document_id (draft)."""
     payload = {
@@ -153,15 +164,13 @@ def create_transfer_document(warehouse_id: int, target_warehouse_id: int) -> int
 
 def add_items_to_document(document_id: int, lines: List[Dict[str, Any]]) -> List[int]:
     """Adds items to an inventory document. Each line must include product_id, quantity, location_name."""
-    payload = {
-        "document_id": document_id,
-        "items": lines
-    }
+    payload = {"document_id": document_id, "items": lines}
     resp = bl_call("addInventoryDocumentItems", payload)
     created = []
     for item in (resp.get("items") or []):
         if "item_id" in item:
-            created.append(int(item["item_id"]))
+            try: created.append(int(item["item_id"]))
+            except: pass
     return created
 
 def confirm_document(document_id: int) -> None:
@@ -173,10 +182,13 @@ def confirm_document(document_id: int) -> None:
 def transfer_order_qty_catalog():
     """
     Creates a single Internal Transfer document (IT) to move ONLY the ordered qty
-    of each product in the given order into the destination bin (location_name).
-    - Looks up catalog product_id by SKU/EAN in your CATALOG_ID.
-    - Creates the doc in WAREHOUSE_ID and sets per-item location_name to the destination bin.
+    of each product in the given order into the destination bin.
+    - Looks up catalog product_id by SKU/EAN in your CATALOG_ID (INVENTORY_ID env).
+    - Creates the doc in WAREHOUSE_ID and sets per-item location_name to the destination.
     - Confirms the document.
+    Accepts:
+      - order_id or order_number
+      - dst  (numeric location_id) OR dst_name (location name)
     """
     try:
         supplied = request.args.get("key") or request.headers.get("X-App-Key")
@@ -186,9 +198,7 @@ def transfer_order_qty_catalog():
         order_id_param = (request.args.get("order_id") or "").strip() or None
         order_number   = (request.args.get("order_number") or "").strip() or None
         dst_loc_id     = (request.args.get("dst") or "").strip()
-
-        if not dst_loc_id:
-            return http_error(400, "Provide dst (destination location ID)")
+        dst_name       = (request.args.get("dst_name") or "").strip()
 
         # Resolve order -> items
         order_id = resolve_order_id(order_id_param, order_number)
@@ -197,10 +207,18 @@ def transfer_order_qty_catalog():
         if not items:
             return http_error(400, "Order has no products")
 
-        # Resolve destination location_name from numeric id
-        loc_name = get_location_name_by_id(dst_loc_id)
+        # Destination: resolve to location_name
+        loc_name = None
+        if dst_name:
+            loc_name = dst_name
+        elif dst_loc_id:
+            loc_name = get_location_name_by_id(dst_loc_id)
+
         if not loc_name:
-            return http_error(400, f"Destination location_id '{dst_loc_id}' not found in warehouse {WAREHOUSE_ID}")
+            return http_error(400,
+                "Destination not found. Pass a valid numeric 'dst' (location_id) or 'dst_name'. "
+                "Tip: GET /bl/locations?key=... to list available locations."
+            )
 
         # Build lines: resolve catalog product_id for each order line; only move ordered qty
         missing = []
@@ -229,23 +247,49 @@ def transfer_order_qty_catalog():
         if not lines:
             return http_error(400, f"No transferrable items (catalog product_id match not found). Missing: {missing}")
 
-        # Create a single IT doc within the same warehouse and confirm it
+        # Create one IT doc within the same warehouse and confirm it
         doc_id = create_transfer_document(int(WAREHOUSE_ID), int(WAREHOUSE_ID))
-        _item_ids = add_items_to_document(doc_id, lines)
+        item_ids = add_items_to_document(doc_id, lines)
         confirm_document(doc_id)
 
         return jsonify({
             "ok": True,
-            "message": f"Confirmed Internal Transfer (IT) for order {order_id} into bin '{loc_name}' (id {dst_loc_id}).",
+            "message": f"Confirmed Internal Transfer (IT) for order {order_id} into '{loc_name}'.",
             "document_id": doc_id,
-            "added_items": _item_ids,
+            "added_items": item_ids,
             "moved_units": sum(l["quantity"] for l in lines),
             "missing": missing
         })
     except Exception as e:
         return http_error(500, "Internal error", detail=f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}")
 
-# --------------- small debug endpoints ---------------
+# --------------- utilities / debug ----------------
+@app.get("/bl/locations")
+def list_locations():
+    """List all locations for WAREHOUSE_ID (try locations endpoint first, then warehouses)."""
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized")
+    try:
+        out = {"warehouse_id": WAREHOUSE_ID, "locations": []}
+        # Preferred
+        try:
+            resp = bl_call("getInventoryLocations", {"warehouse_id": int(WAREHOUSE_ID)})
+            out["locations"] = resp.get("locations") or []
+            if out["locations"]:
+                return jsonify(out)
+        except Exception:
+            pass
+        # Fallback
+        resp = bl_call("getInventoryWarehouses", {})
+        for wh in (resp.get("warehouses") or []):
+            if str(wh.get("warehouse_id")) == str(WAREHOUSE_ID):
+                out["locations"] = wh.get("locations") or []
+                break
+        return jsonify(out)
+    except Exception as e:
+        return http_error(500, "Internal error", detail=str(e))
+
 @app.get("/bl/recent_orders")
 def recent_orders():
     try:
