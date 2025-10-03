@@ -1,4 +1,4 @@
-# app.py — BaseLinker catalog stock + storage documents (Internal Transfer)
+# app.py — BaseLinker catalog stock + storage documents (IGI + IGR for intra-warehouse relocation)
 import os, json, time, traceback
 from typing import Optional, List, Dict, Any
 from flask import Flask, request, jsonify, make_response
@@ -10,12 +10,12 @@ SHARED_KEY = os.environ.get("BL_SHARED_KEY", "")
 
 # ---- YOUR SETUP ----
 WAREHOUSE_ID = "77617"                               # your warehouse id
-CATALOG_ID   = os.environ.get("INVENTORY_ID")        # BaseLinker catalog id (a number). REQUIRED.
+CATALOG_ID   = os.environ.get("INVENTORY_ID")        # BaseLinker catalog (inventory_id) — REQUIRED, numeric
 TIMEOUT      = 30
 
 app = Flask(__name__)
 
-# --------------- helpers ----------------
+# -------------------- helpers --------------------
 def http_error(status: int, msg: str, detail: str = ""):
     payload = {"error": msg}
     if detail:
@@ -47,14 +47,12 @@ def require_catalog_id() -> int:
     except:
         raise RuntimeError("INVENTORY_ID must be numeric (your BaseLinker catalog id).")
 
-# --------------- orders -----------------
+# -------------------- orders ---------------------
 def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
-    """Prefer order_id; else scan recent orders and match by order_number (or by id if number is None)."""
     if order_id:
         return str(order_id).strip()
     if not order_number:
         raise ValueError("Provide order_id or order_number")
-
     needle = str(order_number).strip()
     date_from = int(time.time()) - 60 * 24 * 60 * 60
     matches = []
@@ -71,19 +69,16 @@ def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> st
         page += 1
     if not matches:
         raise LookupError(f"Order with order_number/id '{order_number}' not found")
-
     matches.sort(key=lambda o: (to_int(o.get("date_add")), to_int(o.get("date_confirmed")), to_int(o.get("order_id"))), reverse=True)
     return str(matches[0].get("order_id"))
 
 def get_order_by_id_strict(order_id: str) -> dict:
-    """Fetches one order by ID. Falls back to client scan if direct query returns nothing."""
     oid = str(order_id).strip()
     try:
         resp = bl_call("getOrders", {"order_id": oid, "get_unconfirmed_orders": True})
         orders = resp.get("orders", []) or []
         if orders: return orders[0]
     except: pass
-
     date_from = int(time.time()) - 60 * 24 * 60 * 60
     page = 1
     while page <= 300:
@@ -96,7 +91,7 @@ def get_order_by_id_strict(order_id: str) -> dict:
         page += 1
     raise LookupError(f"Order not found by order_id {oid}")
 
-# ---------- catalog product lookup (by SKU/EAN) ----------
+# ----- catalog product lookup (by SKU/EAN) -----
 def find_catalog_product_id_by_sku(sku: str) -> Optional[int]:
     inv_id = require_catalog_id()
     if not sku: return None
@@ -127,11 +122,10 @@ def resolve_catalog_product_id_from_order_item(it: Dict[str, Any]) -> Optional[i
     pid = find_catalog_product_id_by_ean(ean) if ean else None
     return pid
 
-# ---------- warehouse / bin helpers ----------
+# ------------- warehouse / bin helpers -------------
 def get_location_name_by_id(location_id: str) -> Optional[str]:
     """Map numeric location_id -> location_name. Try locations endpoint first, then warehouses."""
     loc_id = str(location_id).strip()
-    # 1) Preferred: getInventoryLocations
     try:
         resp = bl_call("getInventoryLocations", {"warehouse_id": int(WAREHOUSE_ID)})
         for loc in (resp.get("locations") or []):
@@ -139,7 +133,6 @@ def get_location_name_by_id(location_id: str) -> Optional[str]:
                 return (loc.get("name") or "").strip()
     except Exception:
         pass
-    # 2) Fallback: getInventoryWarehouses
     try:
         resp = bl_call("getInventoryWarehouses", {})
         for wh in (resp.get("warehouses") or []):
@@ -152,18 +145,21 @@ def get_location_name_by_id(location_id: str) -> Optional[str]:
         pass
     return None
 
-# ---------- documents (catalog storage docs) ----------
-def create_transfer_document(warehouse_id: int, target_warehouse_id: int) -> int:
+# ---------------- documents (IGI + IGR) ----------------
+def create_document(document_type: int, warehouse_id: int) -> int:
     """
-    Creates an Internal Transfer (IT) document **in the catalog stock system** and returns document_id (draft).
-    Requires inventory_id (catalog id).
+    Create an inventory document (draft) in catalog stock system.
+    document_type:
+      1 = IGR (Internal Goods Receipt)
+      3 = IGI (Internal Goods Issue)
+      2 = GI  (Goods Issue)        # not used here
+      4 = IT  (Internal Transfer)  # requires different source & target warehouses
     """
     inv_id = require_catalog_id()
     payload = {
-        "inventory_id": inv_id,                  # REQUIRED in catalog mode
+        "inventory_id": inv_id,
         "warehouse_id": int(warehouse_id),
-        "target_warehouse_id": int(target_warehouse_id),  # same for intra-warehouse transfer
-        "document_type": 4                       # IT - Internal Transfer
+        "document_type": int(document_type)
     }
     resp = bl_call("addInventoryDocument", payload)
     doc_id = resp.get("document_id")
@@ -172,8 +168,7 @@ def create_transfer_document(warehouse_id: int, target_warehouse_id: int) -> int
     return int(doc_id)
 
 def add_items_to_document(document_id: int, lines: List[Dict[str, Any]]) -> List[int]:
-    """Adds items to an inventory document. Each line must include product_id, quantity, location_name."""
-    payload = {"document_id": document_id, "items": lines}
+    payload = {"document_id": int(document_id), "items": lines}
     resp = bl_call("addInventoryDocumentItems", payload)
     created = []
     for item in (resp.get("items") or []):
@@ -183,23 +178,18 @@ def add_items_to_document(document_id: int, lines: List[Dict[str, Any]]) -> List
     return created
 
 def confirm_document(document_id: int) -> None:
-    """Confirms the document so the stock/location changes apply."""
-    # BL often returns {} here; we just call and move on
     bl_call("setInventoryDocumentStatusConfirmed", {"document_id": int(document_id)})
 
-# ---------------- core endpoint ----------------
+# -------------------- core endpoint --------------------
 @app.get("/bl/transfer_order_qty_catalog")
 def transfer_order_qty_catalog():
     """
-    Creates a single Internal Transfer document (IT) to move ONLY the ordered qty
-    of each product in the given order into the destination bin.
-    - Looks up catalog product_id by SKU/EAN in your CATALOG_ID (INVENTORY_ID env).
-    - Creates the doc in WAREHOUSE_ID and sets per-item location_name to the destination.
-    - Confirms the document.
-
-    Accepts:
-      - order_id or order_number
-      - dst  (numeric location_id) OR dst_name (location name)
+    Relocate ONLY the ordered qty inside the SAME warehouse via two documents:
+      1) IGI (3) — issue from warehouse (decrease)
+      2) IGR (1) — receipt into destination location (increase)
+    Destination can be provided as:
+      - dst (numeric location_id), or
+      - dst_name (string location name)
     """
     try:
         supplied = request.args.get("key") or request.headers.get("X-App-Key")
@@ -211,36 +201,29 @@ def transfer_order_qty_catalog():
         dst_loc_id     = (request.args.get("dst") or "").strip()
         dst_name       = (request.args.get("dst_name") or "").strip()
 
-        # Resolve order -> items
+        # Resolve order & items
         order_id = resolve_order_id(order_id_param, order_number)
         order = get_order_by_id_strict(order_id)
         items = order.get("products", []) or []
         if not items:
             return http_error(400, "Order has no products")
 
-        # Destination: resolve to location_name
-        loc_name = None
-        if dst_name:
-            loc_name = dst_name
-        elif dst_loc_id:
-            loc_name = get_location_name_by_id(dst_loc_id)
-
+        # Resolve destination location_name
+        loc_name = dst_name or (get_location_name_by_id(dst_loc_id) if dst_loc_id else None)
         if not loc_name:
             return http_error(400,
                 "Destination not found. Pass a valid numeric 'dst' (location_id) or 'dst_name'. "
-                "Tip: GET /bl/locations?key=... to list available locations (if exposed)."
+                "Tip: use the exact location name as in BaseLinker."
             )
 
-        # Build lines: resolve catalog product_id for each order line; only move ordered qty
-        missing = []
-        lines: List[Dict[str, Any]] = []
+        # Build lines (catalog product_id + ordered qty)
+        missing, lines = [], []
         for it in items:
             qty = it.get("quantity") or it.get("qty") or 0
             try: qty = int(qty)
             except: qty = 0
             if qty <= 0:
                 continue
-
             pid = resolve_catalog_product_id_from_order_item(it)
             if not pid:
                 missing.append({
@@ -248,59 +231,44 @@ def transfer_order_qty_catalog():
                     "ean": (it.get("ean") or it.get("product_ean") or "").strip()
                 })
                 continue
-
             lines.append({
                 "product_id": pid,
-                "quantity": qty,
-                "location_name": loc_name  # target location within the same warehouse
+                "quantity": qty
+                # IGI lines: no location_name (decrease from warehouse pool)
             })
 
         if not lines:
             return http_error(400, f"No transferrable items (catalog product_id match not found). Missing: {missing}")
 
-        # Create one IT doc within the same warehouse and confirm it
-        doc_id = create_transfer_document(int(WAREHOUSE_ID), int(WAREHOUSE_ID))
-        item_ids = add_items_to_document(doc_id, lines)
-        confirm_document(doc_id)
+        # 1) IGI: decrease from warehouse (no location_name)
+        igi_id = create_document(document_type=3, warehouse_id=int(WAREHOUSE_ID))  # IGI
+        _igi_items = add_items_to_document(igi_id, lines)
+        confirm_document(igi_id)
+
+        # 2) IGR: increase into destination location_name
+        igr_lines = []
+        for l in lines:
+            igr_lines.append({
+                "product_id": l["product_id"],
+                "quantity": l["quantity"],
+                "location_name": loc_name  # put into the target bin
+            })
+        igr_id = create_document(document_type=1, warehouse_id=int(WAREHOUSE_ID))  # IGR
+        _igr_items = add_items_to_document(igr_id, igr_lines)
+        confirm_document(igr_id)
 
         return jsonify({
             "ok": True,
-            "message": f"Confirmed Internal Transfer (IT) for order {order_id} into '{loc_name}'.",
-            "document_id": doc_id,
-            "added_items": item_ids,
+            "message": f"Relocated ordered qty for order {order_id} into '{loc_name}' using IGI+IGR.",
+            "igi_document_id": igi_id,
+            "igr_document_id": igr_id,
             "moved_units": sum(l["quantity"] for l in lines),
             "missing": missing
         })
     except Exception as e:
         return http_error(500, "Internal error", detail=f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}")
 
-# --------------- utilities / debug ----------------
-@app.get("/bl/locations")
-def list_locations():
-    """List all locations for WAREHOUSE_ID (try locations endpoint first, then warehouses)."""
-    supplied = request.args.get("key") or request.headers.get("X-App-Key")
-    if SHARED_KEY and supplied != SHARED_KEY:
-        return http_error(401, "Unauthorized")
-    try:
-        out = {"warehouse_id": WAREHOUSE_ID, "locations": []}
-        # Preferred
-        try:
-            resp = bl_call("getInventoryLocations", {"warehouse_id": int(WAREHOUSE_ID)})
-            out["locations"] = resp.get("locations") or []
-            if out["locations"]:
-                return jsonify(out)
-        except Exception:
-            pass
-        # Fallback
-        resp = bl_call("getInventoryWarehouses", {})
-        for wh in (resp.get("warehouses") or []):
-            if str(wh.get("warehouse_id")) == str(WAREHOUSE_ID):
-                out["locations"] = wh.get("locations") or []
-                break
-        return jsonify(out)
-    except Exception as e:
-        return http_error(500, "Internal error", detail=str(e))
-
+# ---------------- utilities / debug ----------------
 @app.get("/bl/recent_orders")
 def recent_orders():
     try:
@@ -310,8 +278,7 @@ def recent_orders():
         days = int(request.args.get("days", "2"))
         limit = int(request.args.get("limit", "50"))
         date_from = int(time.time()) - max(1, days) * 24 * 60 * 60
-        results = []
-        page = 1
+        results, page = [], 1
         while len(results) < limit and page <= 200:
             resp = bl_call("getOrders", {"date_from": date_from, "get_unconfirmed_orders": True, "page": page})
             rows = resp.get("orders", []) or []
@@ -333,7 +300,6 @@ def recent_orders():
 
 @app.get("/bl/find_order")
 def find_order():
-    """Client-side scan by provided value; matches order_number OR (when None) order_id."""
     try:
         supplied = request.args.get("key") or request.headers.get("X-App-Key")
         if SHARED_KEY and supplied != SHARED_KEY:
@@ -344,8 +310,7 @@ def find_order():
         needle = order_number
         days = int(request.args.get("days", "60"))
         date_from = int(time.time()) - max(1, days) * 24 * 60 * 60
-        matches = []
-        page = 1
+        matches, page = [], 1
         while page <= 300 and len(matches) < 200:
             resp = bl_call("getOrders", {"date_from": date_from, "get_unconfirmed_orders": True, "page": page})
             rows = resp.get("orders", []) or []
@@ -369,9 +334,31 @@ def find_order():
     except Exception as e:
         return http_error(500, "Internal error", detail=str(e))
 
+@app.get("/bl/locations")
+def list_locations():
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized")
+    try:
+        out = {"warehouse_id": WAREHOUSE_ID, "locations": []}
+        try:
+            resp = bl_call("getInventoryLocations", {"warehouse_id": int(WAREHOUSE_ID)})
+            out["locations"] = resp.get("locations") or []
+            if out["locations"]:
+                return jsonify(out)
+        except Exception:
+            pass
+        resp = bl_call("getInventoryWarehouses", {})
+        for wh in (resp.get("warehouses") or []):
+            if str(wh.get("warehouse_id")) == str(WAREHOUSE_ID):
+                out["locations"] = wh.get("locations") or []
+                break
+        return jsonify(out)
+    except Exception as e:
+        return http_error(500, "Internal error", detail=str(e))
+
 @app.get("/bl/inventories")
 def list_inventories():
-    """Reveal available catalogs (inventories) so you can set INVENTORY_ID correctly."""
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         return http_error(401, "Unauthorized")
