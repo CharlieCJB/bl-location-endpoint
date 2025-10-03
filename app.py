@@ -1,4 +1,4 @@
-# app.py  — BaseLinker catalog stock + storage documents (IT)
+# app.py — BaseLinker catalog stock + storage documents (Internal Transfer)
 import os, json, time, traceback
 from typing import Optional, List, Dict, Any
 from flask import Flask, request, jsonify, make_response
@@ -37,6 +37,15 @@ def bl_call(method: str, params: dict) -> dict:
 def to_int(x) -> int:
     try: return int(x or 0)
     except: return 0
+
+def require_catalog_id() -> int:
+    cid = os.environ.get("INVENTORY_ID")
+    if not cid:
+        raise RuntimeError("INVENTORY_ID env var (BaseLinker catalog id) is required.")
+    try:
+        return int(cid)
+    except:
+        raise RuntimeError("INVENTORY_ID must be numeric (your BaseLinker catalog id).")
 
 # --------------- orders -----------------
 def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
@@ -88,14 +97,6 @@ def get_order_by_id_strict(order_id: str) -> dict:
     raise LookupError(f"Order not found by order_id {oid}")
 
 # ---------- catalog product lookup (by SKU/EAN) ----------
-def require_catalog_id() -> int:
-    if not CATALOG_ID:
-        raise RuntimeError("INVENTORY_ID env var (BaseLinker catalog id) is required.")
-    try:
-        return int(CATALOG_ID)
-    except:
-        raise RuntimeError("INVENTORY_ID must be an integer catalog id (see getInventories).")
-
 def find_catalog_product_id_by_sku(sku: str) -> Optional[int]:
     inv_id = require_catalog_id()
     if not sku: return None
@@ -153,14 +154,22 @@ def get_location_name_by_id(location_id: str) -> Optional[str]:
 
 # ---------- documents (catalog storage docs) ----------
 def create_transfer_document(warehouse_id: int, target_warehouse_id: int) -> int:
-    """Creates an Internal Transfer (IT) document and returns its document_id (draft)."""
+    """
+    Creates an Internal Transfer (IT) document **in the catalog stock system** and returns document_id (draft).
+    Requires inventory_id (catalog id).
+    """
+    inv_id = require_catalog_id()
     payload = {
-        "warehouse_id": warehouse_id,
-        "target_warehouse_id": target_warehouse_id,  # same warehouse for intra-warehouse move
-        "document_type": 4  # IT - Internal Transfer
+        "inventory_id": inv_id,                  # REQUIRED in catalog mode
+        "warehouse_id": int(warehouse_id),
+        "target_warehouse_id": int(target_warehouse_id),  # same for intra-warehouse transfer
+        "document_type": 4                       # IT - Internal Transfer
     }
-    resp = bl_call("addInventoryDocument", payload)  # draft doc. Must be confirmed later.
-    return int(resp.get("document_id"))
+    resp = bl_call("addInventoryDocument", payload)
+    doc_id = resp.get("document_id")
+    if not doc_id:
+        raise RuntimeError(f"addInventoryDocument returned no document_id. Response: {resp}")
+    return int(doc_id)
 
 def add_items_to_document(document_id: int, lines: List[Dict[str, Any]]) -> List[int]:
     """Adds items to an inventory document. Each line must include product_id, quantity, location_name."""
@@ -175,6 +184,7 @@ def add_items_to_document(document_id: int, lines: List[Dict[str, Any]]) -> List
 
 def confirm_document(document_id: int) -> None:
     """Confirms the document so the stock/location changes apply."""
+    # BL often returns {} here; we just call and move on
     bl_call("setInventoryDocumentStatusConfirmed", {"document_id": int(document_id)})
 
 # ---------------- core endpoint ----------------
@@ -186,6 +196,7 @@ def transfer_order_qty_catalog():
     - Looks up catalog product_id by SKU/EAN in your CATALOG_ID (INVENTORY_ID env).
     - Creates the doc in WAREHOUSE_ID and sets per-item location_name to the destination.
     - Confirms the document.
+
     Accepts:
       - order_id or order_number
       - dst  (numeric location_id) OR dst_name (location name)
@@ -217,7 +228,7 @@ def transfer_order_qty_catalog():
         if not loc_name:
             return http_error(400,
                 "Destination not found. Pass a valid numeric 'dst' (location_id) or 'dst_name'. "
-                "Tip: GET /bl/locations?key=... to list available locations."
+                "Tip: GET /bl/locations?key=... to list available locations (if exposed)."
             )
 
         # Build lines: resolve catalog product_id for each order line; only move ordered qty
@@ -227,7 +238,7 @@ def transfer_order_qty_catalog():
             qty = it.get("quantity") or it.get("qty") or 0
             try: qty = int(qty)
             except: qty = 0
-            if qty <= 0: 
+            if qty <= 0:
                 continue
 
             pid = resolve_catalog_product_id_from_order_item(it)
@@ -355,6 +366,18 @@ def find_order():
             "shop_id": o.get("shop_id"),
         } for o in matches]
         return jsonify({"count": len(out), "matches": out})
+    except Exception as e:
+        return http_error(500, "Internal error", detail=str(e))
+
+@app.get("/bl/inventories")
+def list_inventories():
+    """Reveal available catalogs (inventories) so you can set INVENTORY_ID correctly."""
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized")
+    try:
+        resp = bl_call("getInventories", {})
+        return jsonify(resp)
     except Exception as e:
         return http_error(500, "Internal error", detail=str(e))
 
