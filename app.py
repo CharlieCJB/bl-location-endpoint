@@ -1,4 +1,4 @@
-# app.py — BaseLinker catalog stock: relocate ordered qty via IGI + IGR (supports multiple source bins)
+# app.py — BaseLinker catalog stock: relocate ordered qty via IGI + IGR (first-fit bins, optional partials)
 import os, json, time, traceback
 from typing import Optional, List, Dict, Any
 from flask import Flask, request, jsonify, make_response
@@ -93,35 +93,43 @@ def get_order_by_id_strict(order_id: str) -> dict:
     raise LookupError(f"Order not found by order_id {oid}")
 
 # -------- catalog product lookup (by SKU/EAN) --------
-def find_catalog_product_id_by_sku(sku: str) -> Optional[int]:
+def find_catalog_product_id_by_sku(sku: str, include: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     inv_id = require_catalog_id()
     if not sku: return None
-    resp = bl_call("getInventoryProductsList", {"inventory_id": inv_id, "filter_sku": sku})
+    params = {"inventory_id": inv_id, "filter_sku": sku}
+    if include: params["include"] = include
+    resp = bl_call("getInventoryProductsList", params)
     prods = resp.get("products", {}) or {}
     for pid_str, pdata in prods.items():
         if (pdata.get("sku") or "").strip() == sku.strip():
-            try: return int(pid_str)
-            except: return None
+            pdata = dict(pdata)
+            pdata["product_id"] = int(pid_str)
+            return pdata
     return None
 
-def find_catalog_product_id_by_ean(ean: str) -> Optional[int]:
+def find_catalog_product_id_by_ean(ean: str, include: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     inv_id = require_catalog_id()
     if not ean: return None
-    resp = bl_call("getInventoryProductsList", {"inventory_id": inv_id, "filter_ean": ean})
+    params = {"inventory_id": inv_id, "filter_ean": ean}
+    if include: params["include"] = include
+    resp = bl_call("getInventoryProductsList", params)
     prods = resp.get("products", {}) or {}
     for pid_str, pdata in prods.items():
         if (pdata.get("ean") or "").strip() == ean.strip():
-            try: return int(pid_str)
-            except: return None
+            pdata = dict(pdata)
+            pdata["product_id"] = int(pid_str)
+            return pdata
     return None
 
-def resolve_catalog_product_id_from_order_item(it: Dict[str, Any]) -> Optional[int]:
+def resolve_catalog_product_from_order_item(it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    # include locations/stock for debugging if BL returns them
+    include = ["locations", "stock"]
     sku = (it.get("sku") or it.get("product_sku") or "").strip()
     ean = (it.get("ean") or it.get("product_ean") or "").strip()
-    pid = find_catalog_product_id_by_sku(sku) if sku else None
-    if pid: return pid
-    pid = find_catalog_product_id_by_ean(ean) if ean else None
-    return pid
+    rec = find_catalog_product_id_by_sku(sku, include=include) if sku else None
+    if rec: return rec
+    rec = find_catalog_product_id_by_ean(ean, include=include) if ean else None
+    return rec
 
 # -------- warehouse / bin helpers --------
 def get_location_name_by_id(location_id: str) -> Optional[str]:
@@ -182,22 +190,52 @@ def add_items_to_document(document_id: int, lines: List[Dict[str, Any]]) -> List
 def confirm_document(document_id: int) -> None:
     bl_call("setInventoryDocumentStatusConfirmed", {"document_id": int(document_id)})
 
+# ------------- debug helper: catalog locations for SKU -------------
+@app.get("/bl/catalog_locations_for_sku")
+def catalog_locations_for_sku():
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized")
+    sku = (request.args.get("sku") or "").strip()
+    if not sku:
+        return http_error(400, "Provide sku")
+    try:
+        rec = find_catalog_product_id_by_sku(sku, include=["locations", "stock"])
+        if not rec:
+            return http_error(404, f"SKU '{sku}' not found in catalog {require_catalog_id()}")
+        return jsonify({
+            "product_id": rec.get("product_id"),
+            "sku": rec.get("sku"),
+            "ean": rec.get("ean"),
+            "locations": rec.get("locations"),   # if BL returns
+            "stock": rec.get("stock")            # if BL returns
+        })
+    except Exception as e:
+        return http_error(500, "Internal error", detail=str(e))
+
 # ---------------- core endpoint ----------------
 @app.get("/bl/transfer_order_qty_catalog")
 def transfer_order_qty_catalog():
     """
     Relocate ONLY the ordered qty inside the SAME warehouse via two documents:
-      1) IGI (3) — issue from specified source bin(s)
-      2) IGR (1) — receipt into destination bin
+      1) IGI (3) — issue from specified source bin(s), first-fit in order
+      2) IGR (1) — receipt into destination bin (only qty actually issued)
 
     Params:
       - order_id or order_number (one required)
       - dst (location_id) OR dst_name (location name)  -> destination bin
       - src_name (single source bin name) OR src_names=CSV (multiple source bin names)
-        -> required in strict control to ensure IGI removes from real bins
+      - partial=true|false (default false): if true, try smaller quantities when full qty can't be issued from any single bin
 
-    Strategy for multiple sources:
-      - For each product line, split the ordered qty evenly across all src_names.
+    Strategy:
+      For each product:
+        - remaining = ordered qty
+        - for each src bin in order:
+            attempt to add ONE IGI line with quantity=remaining from that bin
+            if accepted -> remaining = 0 and stop
+        - if partial and remaining > 0:
+            progressively try smaller quantities across bins (binary-ish down to 1)
+      Then IGR receives the total quantity that IGI actually issued, into dst.
     """
     try:
         supplied = request.args.get("key") or request.headers.get("X-App-Key")
@@ -213,6 +251,8 @@ def transfer_order_qty_catalog():
         src_name   = (request.args.get("src_name") or "").strip()
         src_names  = (request.args.get("src_names") or "").strip()
         src_list = [s.strip() for s in src_names.split(",") if s.strip()] if src_names else ([src_name] if src_name else [])
+
+        partial = (request.args.get("partial") or "").strip().lower() in ("1","true","yes","y")
 
         if not src_list:
             return http_error(400, "Please specify source bin(s): use src_name=<bin> or src_names=BinA,BinB.")
@@ -243,53 +283,87 @@ def transfer_order_qty_catalog():
             except: qty = 0
             if qty <= 0:
                 continue
-            pid = resolve_catalog_product_id_from_order_item(it)
-            if not pid:
+            rec = resolve_catalog_product_from_order_item(it)
+            if not rec:
                 missing.append({
                     "sku": (it.get("sku") or it.get("product_sku") or "").strip(),
                     "ean": (it.get("ean") or it.get("product_ean") or "").strip()
                 })
                 continue
-            base_lines.append({"product_id": pid, "quantity": qty})
+            base_lines.append({"product_id": int(rec["product_id"]), "quantity": qty})
 
         if not base_lines:
             return http_error(400, f"No transferrable items (catalog product_id match not found). Missing: {missing}")
 
-        # -------- IGI: issue from source bins (even split per product) --------
+        # -------- IGI: first-fit over source bins (plus optional partials) --------
         igi_id = create_document(document_type=3, warehouse_id=int(WAREHOUSE_ID))  # IGI
-        igi_lines: List[Dict[str, Any]] = []
+
+        total_issued = 0
+        igi_attempted_items = 0
+
+        def try_issue(pid: int, qty_try: int, src_bin: str) -> int:
+            """Attempt to issue qty_try of pid from src_bin. Return qty_success (0 or qty_try)."""
+            nonlocal igi_attempted_items
+            line = {"product_id": pid, "quantity": qty_try, "location_name": src_bin}
+            resp_ids = add_items_to_document(igi_id, [line])
+            igi_attempted_items += 1
+            return qty_try if resp_ids else 0
+
+        issued_per_product: Dict[int, int] = {}
 
         for l in base_lines:
-            qty = int(l["quantity"])
-            n = max(1, len(src_list))
-            # Even split; remainder goes to last bin
-            per = max(1, qty // n)
-            remaining = qty
-            for i, src in enumerate(src_list):
-                take = per if i < n - 1 else remaining
-                if take <= 0:
-                    continue
-                igi_lines.append({
-                    "product_id": l["product_id"],
-                    "quantity": take,
-                    "location_name": src  # consume from this bin
-                })
-                remaining -= take
+            pid = l["product_id"]
+            remaining = int(l["quantity"])
 
-        igi_item_ids = add_items_to_document(igi_id, igi_lines)
-        if not igi_item_ids:
-            return http_error(400, "IGI failed to add any items. Check source bin names and that those bins have stock.")
+            # First-fit: full remaining from each src in order
+            for src in src_list:
+                if remaining <= 0:
+                    break
+                got = try_issue(pid, remaining, src)
+                if got > 0:
+                    issued_per_product[pid] = issued_per_product.get(pid, 0) + got
+                    total_issued += got
+                    remaining = 0
+                    break
+
+            # Partial mode: try smaller amounts if no bin could take full remaining
+            if partial and remaining > 0:
+                # simple decreasing attempt: try halves until 1
+                attempt = max(1, remaining // 2)
+                tried_quantities = set()
+                while remaining > 0 and attempt >= 1:
+                    if attempt in tried_quantities:
+                        attempt -= 1
+                        continue
+                    tried_quantities.add(attempt)
+                    placed_any = False
+                    for src in src_list:
+                        if remaining <= 0:
+                            break
+                        got = try_issue(pid, min(attempt, remaining), src)
+                        if got > 0:
+                            issued_per_product[pid] = issued_per_product.get(pid, 0) + got
+                            total_issued += got
+                            remaining -= got
+                            placed_any = True
+                    if not placed_any:
+                        attempt -= 1
+
+        if total_issued == 0:
+            return http_error(400, "IGI could not issue any items. Check source bin names and per-bin stock for these SKUs.")
+
         confirm_document(igi_id)
 
-        # -------- IGR: receipt into destination bin --------
+        # -------- IGR: receipt exactly what was issued into destination bin --------
         igr_id = create_document(document_type=1, warehouse_id=int(WAREHOUSE_ID))  # IGR
         igr_lines = []
-        for l in base_lines:
-            igr_lines.append({
-                "product_id": l["product_id"],
-                "quantity": l["quantity"],
-                "location_name": loc_name
-            })
+        for pid, qty in issued_per_product.items():
+            if qty > 0:
+                igr_lines.append({
+                    "product_id": pid,
+                    "quantity": qty,
+                    "location_name": loc_name
+                })
         igr_item_ids = add_items_to_document(igr_id, igr_lines)
         if not igr_item_ids:
             return http_error(400, "IGR failed to add items. Check destination bin name.")
@@ -297,10 +371,10 @@ def transfer_order_qty_catalog():
 
         return jsonify({
             "ok": True,
-            "message": f"Relocated ordered qty for order {order_id} into '{loc_name}' using IGI+IGR.",
+            "message": f"Relocated issued qty for order {order_id} into '{loc_name}' using IGI+IGR (first-fit{' + partial' if partial else ''}).",
             "igi_document_id": igi_id,
             "igr_document_id": igr_id,
-            "moved_units": sum(l["quantity"] for l in base_lines),
+            "moved_units": total_issued,
             "missing": missing,
             "sources_used": src_list
         })
