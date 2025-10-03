@@ -78,7 +78,8 @@ def get_order_by_id_strict(order_id: str) -> dict:
         resp = bl_call("getOrders", {"order_id": oid, "get_unconfirmed_orders": True})
         orders = resp.get("orders", []) or []
         if orders: return orders[0]
-    except: pass
+    except:
+        pass
     date_from = int(time.time()) - 60 * 24 * 60 * 60
     page = 1
     while page <= 300:
@@ -197,7 +198,6 @@ def transfer_order_qty_catalog():
 
     Strategy for multiple sources:
       - For each product line, split the ordered qty evenly across all src_names.
-      - This is robust across many SKUs when per-bin availability isn't accessible via API.
     """
     try:
         supplied = request.args.get("key") or request.headers.get("X-App-Key")
@@ -267,7 +267,7 @@ def transfer_order_qty_catalog():
             remaining = qty
             for i, src in enumerate(src_list):
                 take = per if i < n - 1 else remaining
-                if take <= 0: 
+                if take <= 0:
                     continue
                 igi_lines.append({
                     "product_id": l["product_id"],
@@ -336,7 +336,7 @@ def recent_orders():
             page += 1
         return jsonify({"count": len(results), "orders": results})
     except Exception as e:
-        return http_error(500, "Internal error", detail:str(e))
+        return http_error(500, "Internal error", detail=str(e))
 
 @app.get("/bl/find_order")
 def find_order():
@@ -372,7 +372,7 @@ def find_order():
         } for o in matches]
         return jsonify({"count": len(out), "matches": out})
     except Exception as e:
-        return http_error(500, "Internal error", detail:str(e))
+        return http_error(500, "Internal error", detail=str(e))
 
 @app.get("/bl/locations")
 def list_locations():
@@ -396,7 +396,7 @@ def list_locations():
                 break
         return jsonify(out)
     except Exception as e:
-        return http_error(500, "Internal error", detail:str(e))
+        return http_error(500, "Internal error", detail=str(e))
 
 @app.get("/health")
 def health():
