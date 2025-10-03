@@ -30,20 +30,33 @@ def bl_call(method: str, params: dict) -> dict:
     return j
 
 def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
-    """Prefer order_id (fast). If only order_number is provided, search recent orders."""
+    """
+    Prefer order_id (fast). If only order_number is provided, search recent orders
+    by creation time (date_from) so very new/unconfirmed orders are included.
+    Includes simple pagination if your account returns a next page token/index.
+    """
     if order_id:
         return str(order_id)
     if not order_number:
         abort(400, "Provide order_id or order_number")
-    # Search the last 365 days; widen if needed
+
     date_from = int(time.time()) - 365 * 24 * 60 * 60
-    resp = bl_call("getOrders", {
-        "date_confirmed_from": date_from,
-        "get_unconfirmed_orders": True
-    })
-    for o in resp.get("orders", []):
-        if str(o.get("order_number", "")).strip() == str(order_number).strip():
-            return str(o.get("order_id"))
+    page_token = None
+    while True:
+        params = {
+            "date_from": date_from,
+            "get_unconfirmed_orders": True,
+        }
+        if page_token:
+            params["page"] = page_token
+        resp = bl_call("getOrders", params)
+        for o in resp.get("orders", []):
+            if str(o.get("order_number", "")).strip() == str(order_number).strip():
+                return str(o.get("order_id"))
+        page_token = resp.get("next_page") or resp.get("page_next") or None
+        if not page_token:
+            break
+
     abort(404, f"Order with order_number '{order_number}' not found in last 365 days")
 
 def get_inventory_id_for_any_product(product_id: str) -> str:
@@ -66,7 +79,7 @@ def list_bins_in_warehouse_dynamic(warehouse_id: str,
     Discover all bin/location IDs for a warehouse via API; fallback to SRC_BINS env var.
     Excludes dst_id and anything in exclude_ids.
     """
-    # Try a dedicated locations endpoint first (if available in your account)
+    # Try a dedicated locations endpoint first (if available)
     try:
         resp = bl_call("getInventoryLocations", {"warehouse_id": warehouse_id})
         bins: List[str] = []
