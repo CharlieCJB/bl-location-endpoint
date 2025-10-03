@@ -15,6 +15,7 @@ TIMEOUT      = 30       # seconds
 # Fallbacks / env
 FALLBACK_INVENTORY_ID = os.environ.get("INVENTORY_ID", "")  # set in Render
 SRC_BINS_ENV = os.environ.get("SRC_BINS", "")               # optional CSV list
+SKU_MAP_ENV  = os.environ.get("SKU_MAP", "")                # optional "SKU1=PID1;SKU2=PID2"
 
 app = Flask(__name__)
 
@@ -60,7 +61,6 @@ def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> st
 
     needle = str(order_number).strip()
 
-    # Robust scan: last 60 days, up to 300 pages (safety caps)
     date_from = int(time.time()) - 60 * 24 * 60 * 60
     matches: List[dict] = []
     page = 1
@@ -90,7 +90,6 @@ def get_order_by_id_strict(order_id: str) -> dict:
     """
     oid = str(order_id).strip()
 
-    # Try direct fetch (include unconfirmed)
     try:
         resp = bl_call("getOrders", {"order_id": oid, "get_unconfirmed_orders": True})
         orders = resp.get("orders", []) or []
@@ -99,7 +98,6 @@ def get_order_by_id_strict(order_id: str) -> dict:
     except Exception:
         pass
 
-    # Fallback: scan last 60 days, client-side match by order_id
     date_from = int(time.time()) - 60 * 24 * 60 * 60
     page = 1
     while page <= 300:
@@ -137,7 +135,7 @@ def discover_inventory_id() -> Optional[str]:
     return None
 
 def get_inventory_id_for_any_product(product_id: str) -> str:
-    # First, try to read from the product (some accounts return it)
+    # Try from product (some accounts return it)
     try:
         inv = bl_call("getInventoryProductsData", {
             "filter_ids": [product_id],
@@ -149,16 +147,13 @@ def get_inventory_id_for_any_product(product_id: str) -> str:
     except Exception:
         pass
 
-    # Next, if an env fallback is set, use it
     if FALLBACK_INVENTORY_ID:
         return FALLBACK_INVENTORY_ID
 
-    # Finally, try to discover from warehouses
     disc = discover_inventory_id()
     if disc:
         return disc
 
-    # Give a clear error if nothing found
     raise LookupError("Could not determine inventory_id. Set INVENTORY_ID env var or ensure getInventoryWarehouses returns one.")
 
 def lookup_inventory_by_sku(sku: str) -> Optional[Dict[str, Any]]:
@@ -182,7 +177,7 @@ def lookup_inventory_by_ean(ean: str) -> Optional[Dict[str, Any]]:
     return prods[0] if prods else None
 
 def sku_map_lookup(sku: str) -> Optional[str]:
-    raw = os.environ.get("SKU_MAP", "")
+    raw = SKU_MAP_ENV
     if not raw or not sku:
         return None
     pairs = [p for p in raw.split(";") if "=" in p]
@@ -194,11 +189,11 @@ def sku_map_lookup(sku: str) -> Optional[str]:
 
 def resolve_inventory_pid_from_order_item(it: Dict[str, Any]) -> Optional[str]:
     """
-    Resolve an inventory product_id for a line. Priority:
+    Resolve an **Inventory** product_id for a line. Priority:
       0) SKU_MAP override
-      1) by SKU
-      2) by EAN
-      3) accept any product_id present on the line (NO validation)
+      1) by SKU (Inventory)
+      2) by EAN (Inventory)
+    Return None if not found (we'll error upstream with details).
     """
     sku = (it.get("sku") or it.get("product_sku") or "").strip()
     override = sku_map_lookup(sku)
@@ -217,12 +212,7 @@ def resolve_inventory_pid_from_order_item(it: Dict[str, Any]) -> Optional[str]:
     if prod and prod.get("product_id"):
         return str(prod["product_id"])
 
-    # 3) Accept any id present on the order line (no validation)
-    for key in ("product_id", "storage_product_id", "inventory_product_id"):
-        cand = it.get(key)
-        if cand:
-            return str(cand)
-
+    # Do NOT accept Catalog/PM product IDs here – only Inventory IDs are valid for stock docs.
     return None
 
 # ---------- bin discovery ----------
@@ -304,9 +294,12 @@ def transfer_order_qty():
             return http_error(404, str(e))
 
         items = order.get("products", []) or []
+        if not items:
+            return http_error(400, "Order has no products")
 
         order_lines: List[Dict[str, Any]] = []
         any_pid_for_inv_lookup: Optional[str] = None
+        missing: List[Dict[str, str]] = []
 
         for it in items:
             qty = it.get("quantity") or it.get("qty") or 0
@@ -322,9 +315,14 @@ def transfer_order_qty():
                 order_lines.append({"product_id": str(pid), "qty_needed": qty, "raw": it})
                 if not any_pid_for_inv_lookup:
                     any_pid_for_inv_lookup = str(pid)
+            else:
+                missing.append({
+                    "sku": (it.get("sku") or it.get("product_sku") or "").strip(),
+                    "ean": (it.get("ean") or it.get("product_ean") or "").strip()
+                })
 
         if not order_lines:
-            return http_error(400, "No transferrable items found on this order (could not resolve product_ids/skus)")
+            return http_error(400, f"No transferrable items (Inventory match not found). Missing: {missing}")
 
         inv_id = get_inventory_id_for_any_product(any_pid_for_inv_lookup)
 
@@ -386,7 +384,8 @@ def transfer_order_qty():
             "moved_units": total_moved,
             "remaining_not_moved": remaining,
             "order_id": order_id,
-            "document_ids": created_ids
+            "document_ids": created_ids,
+            "missing_inventory_matches": missing
         })
     except Exception as e:
         return http_error(500, "Internal error", detail=f"{e.__class__.__name__}: {e}\n{traceback.format_exc()}")
@@ -512,7 +511,7 @@ def recent_orders():
 
 @app.get("/bl/check_product")
 def check_product():
-    """Inspect a product's basic info and its inventory_id."""
+    """Inspect a product's basic info and its inventory_id (by Inventory product_id)."""
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         return http_error(401, "Unauthorized: key mismatch")
@@ -526,7 +525,7 @@ def check_product():
         })
         prods = resp.get("products", []) or []
         if not prods:
-            return http_error(404, f"Product {pid} not found")
+            return http_error(404, f"Inventory product {pid} not found")
         p = prods[0]
         return jsonify({
             "product_id": str(p.get("product_id")),
@@ -534,6 +533,35 @@ def check_product():
             "sku": p.get("sku"),
             "ean": p.get("ean"),
             "inventory_id": str(p.get("inventory_id"))
+        })
+    except Exception as e:
+        return http_error(500, "Internal error", detail=str(e))
+
+@app.get("/bl/find_inventory_product")
+def find_inventory_product():
+    """Lookup Inventory product by SKU or EAN."""
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized: key mismatch")
+    sku = (request.args.get("sku") or "").strip()
+    ean = (request.args.get("ean") or "").strip()
+    if not sku and not ean:
+        return http_error(400, "Provide sku or ean")
+    try:
+        if sku:
+            inv = bl_call("getInventoryProductsData", {"filter_sku": [sku], "include": ["inventory_id", "sku", "ean", "name"]})
+        else:
+            inv = bl_call("getInventoryProductsData", {"filter_ean": [ean], "include": ["inventory_id", "sku", "ean", "name"]})
+        prods = inv.get("products", []) or []
+        if not prods:
+            return http_error(404, f"Inventory product not found for sku='{sku}' ean='{ean}'")
+        p = prods[0]
+        return jsonify({
+            "inventory_product_id": str(p.get("product_id")),
+            "inventory_id": str(p.get("inventory_id")),
+            "sku": p.get("sku"),
+            "ean": p.get("ean"),
+            "name": p.get("name")
         })
     except Exception as e:
         return http_error(500, "Internal error", detail=str(e))
