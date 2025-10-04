@@ -1,9 +1,13 @@
 # app.py — BaseLinker catalog stock relocation via IGI+IGR
-# Flexible endpoint: specify src_names (bins) and dst_name (destination bin).
-# - First-fit IGI across provided bins (in order)
-# - Fallback: if SKU has no bin allocations, issue from unallocated
-# - Optional partial mode (&partial=true) to spread across bins
-# - IGR receipts only what IGI actually issued
+# Flexible endpoint:
+#   /bl/transfer_order_qty_catalog?order_id=...&src_names=BinA,BinB&dst_name=InternalStock&key=...
+#   - First-fit IGI across provided bins (in order)
+#   - Fallback: if SKU has no bin allocations, issue from unallocated
+#   - Optional partial mode (&partial=true) to spread across bins
+#   - IGR receipts only what IGI actually issued
+#
+# Debug endpoint:
+#   /bl/catalog_locations_for_sku?sku=...&key=...
 
 import os, json, time, traceback
 from typing import Optional, List, Dict, Any
@@ -22,7 +26,8 @@ app = Flask(__name__)
 # ---------- helpers ----------
 def http_error(status: int, msg: str, detail: str = ""):
     payload = {"error": msg}
-    if detail: payload["detail"] = detail
+    if detail:
+        payload["detail"] = detail
     return make_response(jsonify(payload), status)
 
 def bl_call(method: str, params: dict) -> dict:
@@ -38,8 +43,10 @@ def bl_call(method: str, params: dict) -> dict:
     return j
 
 def to_int(x) -> int:
-    try: return int(x or 0)
-    except: return 0
+    try:
+        return int(x or 0)
+    except:
+        return 0
 
 def require_catalog_id() -> int:
     cid = os.environ.get("INVENTORY_ID")
@@ -49,29 +56,34 @@ def require_catalog_id() -> int:
 
 # ---------- orders ----------
 def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
-    if order_id: return str(order_id).strip()
-    if not order_number: raise ValueError("Provide order_id or order_number")
+    if order_id:
+        return str(order_id).strip()
+    if not order_number:
+        raise ValueError("Provide order_id or order_number")
     needle = str(order_number).strip()
     date_from = int(time.time()) - 60 * 24 * 60 * 60
     matches, page = [], 1
     while page <= 300:
         resp = bl_call("getOrders", {"date_from": date_from, "get_unconfirmed_orders": True, "page": page})
         rows = resp.get("orders", []) or []
-        if not rows: break
+        if not rows:
+            break
         for o in rows:
             o_num = str(o.get("order_number", "")).strip()
             o_id  = str(o.get("order_id", "")).strip()
             if (o_num and o_num == needle) or (not o_num and o_id == needle):
                 matches.append(o)
         page += 1
-    if not matches: raise LookupError(f"Order with order_number/id '{order_number}' not found")
+    if not matches:
+        raise LookupError(f"Order with order_number/id '{order_number}' not found")
     matches.sort(key=lambda o: (to_int(o.get("date_add")), to_int(o.get("order_id"))), reverse=True)
     return str(matches[0].get("order_id"))
 
 def get_order_by_id_strict(order_id: str) -> dict:
     resp = bl_call("getOrders", {"order_id": str(order_id), "get_unconfirmed_orders": True})
     orders = resp.get("orders", []) or []
-    if orders: return orders[0]
+    if orders:
+        return orders[0]
     raise LookupError(f"Order not found by order_id {order_id}")
 
 # ---------- product resolution ----------
@@ -83,7 +95,8 @@ def find_catalog_product(sku=None, ean=None, include=None) -> Optional[Dict[str,
         params = {"inventory_id": inv_id, "filter_ean": ean}
     else:
         return None
-    if include: params["include"] = include
+    if include:
+        params["include"] = include
     resp = bl_call("getInventoryProductsList", params)
     prods = resp.get("products", {}) or {}
     for pid_str, pdata in prods.items():
@@ -111,8 +124,10 @@ def add_items_to_document(document_id: int, lines: List[Dict[str, Any]]) -> List
     created = []
     for item in (resp.get("items") or []):
         if "item_id" in item:
-            try: created.append(int(item["item_id"]))
-            except: pass
+            try:
+                created.append(int(item["item_id"]))
+            except:
+                pass
     return created
 
 def confirm_document(document_id: int) -> None:
@@ -126,7 +141,7 @@ def transfer_order_qty_catalog():
       - IGI (3): issue from source bin(s), first-fit with optional partials
       - IGR (1): receipt into destination bin
     Params (query):
-      - order_id=...    (you will manually paste the real ID into the URL)
+      - order_id=...    (you will manually paste the real ID into the URL OR pass order_number)
       - src_name=<bin> or src_names=BinA,BinB
       - dst_name=<destination bin>
       - partial=true|false
@@ -145,18 +160,22 @@ def transfer_order_qty_catalog():
         src_list = [s.strip() for s in src_names.split(",") if s.strip()] if src_names else ([src_name] if src_name else [])
         partial        = (request.args.get("partial") or "").strip().lower() in ("1","true","yes")
 
-        if not src_list: return http_error(400, "Please specify src_name or src_names")
-        if not dst_name: return http_error(400, "Please specify dst_name")
+        if not src_list:
+            return http_error(400, "Please specify src_name or src_names")
+        if not dst_name:
+            return http_error(400, "Please specify dst_name")
 
         order_id = resolve_order_id(order_id_param, order_number)
         order = get_order_by_id_strict(order_id)
         items = order.get("products", []) or []
-        if not items: return http_error(400, "Order has no products")
+        if not items:
+            return http_error(400, "Order has no products")
 
         missing, base_lines, has_loc_map = [], [], {}
         for it in items:
             qty = int(it.get("quantity") or it.get("qty") or 0)
-            if qty <= 0: continue
+            if qty <= 0:
+                continue
             rec = resolve_catalog_product_from_order_item(it)
             if not rec:
                 missing.append({"sku": it.get("sku"), "ean": it.get("ean")})
@@ -165,7 +184,8 @@ def transfer_order_qty_catalog():
             has_loc_map[pid] = bool(rec.get("locations"))
             base_lines.append({"product_id": pid, "quantity": qty})
 
-        if not base_lines: return http_error(400, f"No transferrable items. Missing: {missing}")
+        if not base_lines:
+            return http_error(400, f"No transferrable items. Missing: {missing}")
 
         # IGI
         igi_id = create_document(3, int(WAREHOUSE_ID))
@@ -173,7 +193,8 @@ def transfer_order_qty_catalog():
 
         def try_issue(pid: int, qty: int, src_bin: Optional[str]) -> int:
             line = {"product_id": pid, "quantity": qty}
-            if src_bin: line["location_name"] = src_bin
+            if src_bin:
+                line["location_name"] = src_bin
             ids = add_items_to_document(igi_id, [line])
             return qty if ids else 0
 
@@ -182,7 +203,8 @@ def transfer_order_qty_catalog():
 
             # 1) first-fit across bins
             for src in src_list:
-                if remaining <= 0: break
+                if remaining <= 0:
+                    break
                 got = try_issue(pid, remaining, src)
                 if got:
                     issued_per_product[pid] = issued_per_product.get(pid, 0) + got
@@ -217,9 +239,11 @@ def transfer_order_qty_catalog():
                             total_issued += got
                             remaining -= got
                             placed = True
-                    if not placed: attempt -= 1
+                    if not placed:
+                        attempt -= 1
 
-        if total_issued == 0: return http_error(400, "IGI could not issue any items")
+        if total_issued == 0:
+            return http_error(400, "IGI could not issue any items")
 
         confirm_document(igi_id)
 
@@ -228,18 +252,49 @@ def transfer_order_qty_catalog():
         igr_lines = [{"product_id": pid, "quantity": qty, "location_name": dst_name}
                      for pid, qty in issued_per_product.items() if qty > 0]
         igr_item_ids = add_items_to_document(igr_id, igr_lines)
-        if not igr_item_ids: return http_error(400, "IGR failed to add items.")
+        if not igr_item_ids:
+            return http_error(400, "IGR failed to add items.")
         confirm_document(igr_id)
 
-        return jsonify({"ok": True,
-                        "message": f"Relocated issued qty for order {order_id} into '{dst_name}'",
-                        "igi_document_id": igi_id,
-                        "igr_document_id": igr_id,
-                        "moved_units": total_issued,
-                        "missing": missing,
-                        "sources_used": src_list})
+        return jsonify({
+            "ok": True,
+            "message": f"Relocated issued qty for order {order_id} into '{dst_name}'",
+            "igi_document_id": igi_id,
+            "igr_document_id": igr_id,
+            "moved_units": total_issued,
+            "missing": missing,
+            "sources_used": src_list
+        })
+
     except Exception as e:
         return http_error(500, "Internal error", detail=f"{e}\n{traceback.format_exc()}")
 
+# ---------- debug: find exact bin names for a SKU ----------
+@app.get("/bl/catalog_locations_for_sku")
+def catalog_locations_for_sku():
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized")
+    sku = (request.args.get("sku") or "").strip()
+    if not sku:
+        return http_error(400, "Provide sku")
+    try:
+        inv_id = require_catalog_id()
+        resp = bl_call("getInventoryProductsList", {"inventory_id": inv_id, "filter_sku": sku, "include": ["locations","stock"]})
+        prods = resp.get("products") or {}
+        if not prods:
+            return http_error(404, f"SKU {sku} not found")
+        pid, pdata = next(iter(prods.items()))
+        return jsonify({
+            "product_id": int(pid),
+            "sku": pdata.get("sku"),
+            "ean": pdata.get("ean"),
+            "locations": pdata.get("locations"),
+            "stock": pdata.get("stock"),
+        })
+    except Exception as e:
+        return http_error(500, "Internal error", detail=str(e))
+
 @app.get("/health")
-def health(): return "OK\n"
+def health():
+    return "OK\n"
