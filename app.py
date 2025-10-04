@@ -1,5 +1,3 @@
-# app.py — BaseLinker IGI+IGR relocation with detailed IGI failure reasons
-
 import os, json, time, traceback
 from typing import Optional, List, Dict, Any, Tuple
 from flask import Flask, request, jsonify, make_response
@@ -20,8 +18,7 @@ def http_error(status: int, msg: str, detail: str = ""):
     return make_response(jsonify(payload), status)
 
 def bl_call(method: str, params: dict) -> dict:
-    if not BL_TOKEN:
-        raise RuntimeError("BL_TOKEN not set")
+    if not BL_TOKEN: raise RuntimeError("BL_TOKEN not set")
     headers = {"X-BLToken": BL_TOKEN}
     data = {"method": method, "parameters": json.dumps(params)}
     r = requests.post(BL_API_URL, headers=headers, data=data, timeout=TIMEOUT)
@@ -40,7 +37,7 @@ def require_catalog_id() -> int:
     if not cid: raise RuntimeError("INVENTORY_ID env var is required.")
     return int(cid)
 
-# -------- Orders --------
+# ---------- Orders ----------
 def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
     if order_id: return str(order_id).strip()
     if not order_number: raise ValueError("Provide order_id or order_number")
@@ -57,8 +54,7 @@ def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> st
             if (o_num and o_num == needle) or (not o_num and o_id == needle):
                 matches.append(o)
         page += 1
-    if not matches:
-        raise LookupError(f"Order with order_number/id '{order_number}' not found")
+    if not matches: raise LookupError(f"Order with order_number/id '{order_number}' not found")
     matches.sort(key=lambda o: (to_int(o.get("date_add")), to_int(o.get("order_id"))), reverse=True)
     return str(matches[0].get("order_id"))
 
@@ -68,7 +64,7 @@ def get_order_by_id_strict(order_id: str) -> dict:
     if orders: return orders[0]
     raise LookupError(f"Order not found by order_id {order_id}")
 
-# -------- Products --------
+# ---------- Products / ERP units ----------
 def find_catalog_product(sku=None, ean=None, include=None) -> Optional[Dict[str, Any]]:
     inv_id = require_catalog_id()
     if sku:
@@ -92,7 +88,30 @@ def resolve_catalog_product_from_order_item(it: Dict[str, Any]) -> Optional[Dict
     return find_catalog_product(sku=sku, include=["locations","stock"]) or \
            find_catalog_product(ean=ean, include=["locations","stock"])
 
-# -------- Documents --------
+def get_erp_units_for_product(product_id: int) -> List[Dict[str, Any]]:
+    """Fetch ERP units (batches) for a product (price/expiry available here)."""
+    inv_id = require_catalog_id()
+    resp = bl_call("getInventoryProductsData", {
+        "inventory_id": inv_id,
+        "products": [int(product_id)],
+        "include_erp_units": True
+    })
+    items = (resp.get("products") or {}).get(str(product_id)) or {}
+    units = items.get("erp_units") or []
+    # Normalize keys we care about
+    norm = []
+    for u in units:
+        norm.append({
+            "price": u.get("price"),
+            "expiry_date": u.get("expiry_date"),  # YYYY-MM-DD or None
+            "batch": u.get("batch"),
+            "qty": to_int(u.get("quantity") or u.get("qty"))
+        })
+    # Sort by soonest expiry first, then any without expiry
+    norm.sort(key=lambda u: (u["expiry_date"] or "9999-12-31"))
+    return norm
+
+# ---------- Documents ----------
 def create_document(document_type: int, warehouse_id: int) -> int:
     payload = {"inventory_id": require_catalog_id(), "warehouse_id": int(warehouse_id), "document_type": int(document_type)}
     resp = bl_call("addInventoryDocument", payload)
@@ -101,7 +120,6 @@ def create_document(document_type: int, warehouse_id: int) -> int:
     return int(resp["document_id"])
 
 def add_items_to_document_verbose(document_id: int, lines: List[Dict[str, Any]]) -> Tuple[List[int], dict]:
-    """Return (created_item_ids, raw_response) so we can surface BL's failure reasons."""
     resp = bl_call("addInventoryDocumentItems", {"document_id": int(document_id), "items": lines})
     created = []
     for item in (resp.get("items") or []):
@@ -113,7 +131,7 @@ def add_items_to_document_verbose(document_id: int, lines: List[Dict[str, Any]])
 def confirm_document(document_id: int) -> None:
     bl_call("setInventoryDocumentStatusConfirmed", {"document_id": int(document_id)})
 
-# -------- Debug helpers --------
+# ---------- Debug helpers ----------
 def get_location_name_by_id(location_id: str) -> Optional[str]:
     try:
         resp = bl_call("getInventoryLocations", {"warehouse_id": int(WAREHOUSE_ID)})
@@ -157,7 +175,7 @@ def debug_order_lines():
         out.append({"sku": sku, "ean": ean, "qty": qty, "product_id": pid, "has_locations": has_loc})
     return jsonify({"order_id": oid, "lines": out})
 
-# -------- Main endpoint --------
+# ---------- Main endpoint ----------
 @app.get("/bl/transfer_order_qty_catalog")
 def transfer_order_qty_catalog():
     try:
@@ -179,9 +197,7 @@ def transfer_order_qty_catalog():
         only_skus = [s.strip() for s in only_skus_raw.split(",") if s.strip()] if only_skus_raw else []
         prefer_unallocated = (request.args.get("prefer_unallocated") or "").strip().lower() in ("1","true","yes")
 
-        # Allow pure unallocated test: src_list can be empty if prefer_unallocated=1
         if not dst_name:
-            # allow id-based dst if they prefer
             dst_name = get_location_name_by_id(dst_loc_id) if dst_loc_id else None
         if not dst_name:
             return http_error(400, "Destination not found. Use dst_name=<bin name>.")
@@ -213,57 +229,73 @@ def transfer_order_qty_catalog():
         if not base_lines:
             return http_error(400, f"No transferrable items. Missing: {missing}, only_skus={only_skus}")
 
-        # IGI
         igi_id = create_document(3, int(WAREHOUSE_ID))
         issued_per_product, total_issued = {}, 0
         fail_reasons: List[Dict[str, Any]] = []
 
-        def try_issue_verbose(pid: int, qty: int, src_bin: Optional[str]) -> int:
+        def try_issue_from_bin(pid: int, qty: int, src_bin: Optional[str]) -> int:
             line = {"product_id": pid, "quantity": qty}
             if src_bin: line["location_name"] = src_bin
             created, raw = add_items_to_document_verbose(igi_id, [line])
-            if created:
-                return qty
-            else:
-                fail_reasons.append({
-                    "product_id": pid,
-                    "attempt_qty": qty,
-                    "src_bin": src_bin,
-                    "response": raw
-                })
+            if created: return qty
+            fail_reasons.append({"product_id": pid, "attempt_qty": qty, "src_bin": src_bin, "response": raw})
+            return 0
+
+        def try_issue_unallocated_with_erp(pid: int, qty: int) -> int:
+            """When ERP units are used, we must pass expiry_date/price to match a unit."""
+            units = get_erp_units_for_product(pid)
+            if not units:  # no ERP units registered
+                # try plain unallocated once (no expiry/price)
+                created, raw = add_items_to_document_verbose(igi_id, [{"product_id": pid, "quantity": qty}])
+                if created: return qty
+                fail_reasons.append({"product_id": pid, "attempt_qty": qty, "src_bin": None, "response": raw})
                 return 0
+            remaining = qty
+            moved = 0
+            for u in units:
+                if remaining <= 0: break
+                take = min(remaining, to_int(u["qty"]))
+                if take <= 0: continue
+                line = {"product_id": pid, "quantity": take}
+                if u.get("expiry_date"): line["expiry_date"] = u["expiry_date"]
+                if u.get("price") is not None: line["price"] = u["price"]
+                if u.get("batch"): line["batch"] = u["batch"]
+                created, raw = add_items_to_document_verbose(igi_id, [line])
+                if created:
+                    moved += take
+                    remaining -= take
+                else:
+                    fail_reasons.append({"product_id": pid, "attempt_qty": take, "src_bin": None, "erp_unit": u, "response": raw})
+                    break
+            return moved
 
         for l in base_lines:
             pid, remaining = l["product_id"], l["quantity"]
 
-            # Prefer unallocated first if requested
             if prefer_unallocated and remaining > 0:
-                got = try_issue_verbose(pid, remaining, None)
+                got = try_issue_unallocated_with_erp(pid, remaining)
                 if got:
                     issued_per_product[pid] = issued_per_product.get(pid, 0) + got
                     total_issued += got
-                    remaining = 0
+                    remaining -= got
 
-            # First-fit bins
             if remaining > 0 and src_list:
                 for src in src_list:
                     if remaining <= 0: break
-                    got = try_issue_verbose(pid, remaining, src)
+                    got = try_issue_from_bin(pid, remaining, src)
                     if got:
                         issued_per_product[pid] = issued_per_product.get(pid, 0) + got
                         total_issued += got
                         remaining = 0
                         break
 
-            # Fallback: unallocated if product has no bin allocations
             if remaining > 0 and not has_loc_map.get(pid, False):
-                got = try_issue_verbose(pid, remaining, None)
+                got = try_issue_unallocated_with_erp(pid, remaining)
                 if got:
                     issued_per_product[pid] = issued_per_product.get(pid, 0) + got
                     total_issued += got
-                    remaining = 0
+                    remaining -= got
 
-            # Optional partials
             if remaining > 0 and partial:
                 attempt = max(1, remaining // 2)
                 while remaining > 0 and attempt >= 1:
@@ -271,14 +303,14 @@ def transfer_order_qty_catalog():
                     if src_list:
                         for src in src_list:
                             if remaining <= 0: break
-                            got = try_issue_verbose(pid, min(attempt, remaining), src)
+                            got = try_issue_from_bin(pid, min(attempt, remaining), src)
                             if got:
                                 issued_per_product[pid] = issued_per_product.get(pid, 0) + got
                                 total_issued += got
                                 remaining -= got
                                 placed = True
                     if not placed and (prefer_unallocated or not has_loc_map.get(pid, False)):
-                        got = try_issue_verbose(pid, min(attempt, remaining), None)
+                        got = try_issue_unallocated_with_erp(pid, min(attempt, remaining))
                         if got:
                             issued_per_product[pid] = issued_per_product.get(pid, 0) + got
                             total_issued += got
@@ -293,7 +325,7 @@ def transfer_order_qty_catalog():
                 "skus_in_scope": skus_in_scope,
                 "prefer_unallocated": prefer_unallocated,
                 "src_list": src_list,
-                "fail_reasons": fail_reasons  # <- raw BL responses for each failed add
+                "fail_reasons": fail_reasons
             }
             return http_error(400, "IGI could not issue any items", detail=json.dumps(ctx))
 
