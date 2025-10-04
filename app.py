@@ -1,10 +1,10 @@
 # app.py — BaseLinker catalog stock relocation via IGI+IGR
-# Features:
-#  - First-fit IGI across src_names (in order)
-#  - Fallback: if SKU has no bin allocations, issue from unallocated (no location_name)
-#  - Optional partial mode (&partial=true) to spread across bins if needed
-#  - IGR receipts only what IGI actually issued
-#  - Debug helpers for recent orders, finding orders, locations, SKU locations
+# Your original behaviour + two safe toggles:
+#  - only_skus=SKU1,SKU2    -> process only these SKUs from the order
+#  - prefer_unallocated=1   -> try issuing from unallocated first, then src bins
+#
+# Debug:
+#  - /bl/debug_order_lines?order_id=...&key=...  -> shows resolved SKUs, product_ids, has_locations
 
 import os, json, time, traceback
 from typing import Optional, List, Dict, Any
@@ -15,8 +15,8 @@ BL_API_URL = "https://api.baselinker.com/connector.php"
 BL_TOKEN   = os.environ.get("BL_TOKEN")
 SHARED_KEY = os.environ.get("BL_SHARED_KEY", "")
 
-WAREHOUSE_ID = "77617"                         # your warehouse id
-CATALOG_ID   = os.environ.get("INVENTORY_ID")  # BaseLinker catalog id (required)
+WAREHOUSE_ID = "77617"
+CATALOG_ID   = os.environ.get("INVENTORY_ID")
 TIMEOUT      = 30
 
 app = Flask(__name__)
@@ -138,10 +138,19 @@ def transfer_order_qty_catalog():
         order_number   = (request.args.get("order_number") or "").strip() or None
         dst_loc_id     = (request.args.get("dst") or "").strip()
         dst_name       = (request.args.get("dst_name") or "").strip()
+
         src_name   = (request.args.get("src_name") or "").strip()
         src_names  = (request.args.get("src_names") or "").strip()
         src_list = [s.strip() for s in src_names.split(",") if s.strip()] if src_names else ([src_name] if src_name else [])
+
         partial = (request.args.get("partial") or "").strip().lower() in ("1","true","yes")
+
+        # NEW: allow filtering to specific SKUs only
+        only_skus_raw  = (request.args.get("only_skus") or "").strip()
+        only_skus = [s.strip() for s in only_skus_raw.split(",") if s.strip()] if only_skus_raw else []
+
+        # NEW: prefer unallocated first if requested
+        prefer_unallocated = (request.args.get("prefer_unallocated") or "").strip().lower() in ("1","true","yes")
 
         order_id = resolve_order_id(order_id_param, order_number)
         order = get_order_by_id_strict(order_id)
@@ -152,8 +161,11 @@ def transfer_order_qty_catalog():
         if not loc_name:
             return http_error(400, "Destination not found. Use dst_name=<bin name>.")
 
-        missing, base_lines, has_loc_map = [], [], {}
+        missing, base_lines, has_loc_map, skus_in_scope = [], [], {}, []
         for it in items:
+            line_sku = (it.get("sku") or it.get("product_sku") or "").strip()
+            if only_skus and line_sku not in only_skus:
+                continue
             qty = int(it.get("quantity") or it.get("qty") or 0)
             if qty <= 0: continue
             rec = resolve_catalog_product_from_order_item(it)
@@ -163,9 +175,10 @@ def transfer_order_qty_catalog():
             pid = rec["product_id"]
             has_loc_map[pid] = bool(rec.get("locations"))
             base_lines.append({"product_id": pid, "quantity": qty})
+            skus_in_scope.append(line_sku)
 
         if not base_lines:
-            return http_error(400, f"No transferrable items. Missing: {missing}")
+            return http_error(400, f"No transferrable items. Missing: {missing}, only_skus={only_skus}")
 
         # --- IGI ---
         igi_id = create_document(3, int(WAREHOUSE_ID))
@@ -180,15 +193,24 @@ def transfer_order_qty_catalog():
         for l in base_lines:
             pid, remaining = l["product_id"], l["quantity"]
 
-            # try bins first-fit
-            for src in src_list:
-                if remaining <= 0: break
-                got = try_issue(pid, remaining, src)
+            # NEW: optionally try unallocated FIRST
+            if prefer_unallocated:
+                got = try_issue(pid, remaining, None)
                 if got:
                     issued_per_product[pid] = issued_per_product.get(pid, 0) + got
                     total_issued += got
                     remaining = 0
-                    break
+
+            # try bins first-fit
+            if remaining > 0:
+                for src in src_list:
+                    if remaining <= 0: break
+                    got = try_issue(pid, remaining, src)
+                    if got:
+                        issued_per_product[pid] = issued_per_product.get(pid, 0) + got
+                        total_issued += got
+                        remaining = 0
+                        break
 
             # fallback: unallocated issue if product has no bin allocations
             if remaining > 0 and not has_loc_map.get(pid, False):
@@ -210,7 +232,7 @@ def transfer_order_qty_catalog():
                             total_issued += got
                             remaining -= got
                             placed = True
-                    if not placed and not has_loc_map.get(pid, False):
+                    if not placed and (prefer_unallocated or not has_loc_map.get(pid, False)):
                         got = try_issue(pid, min(attempt, remaining), None)
                         if got:
                             issued_per_product[pid] = issued_per_product.get(pid, 0) + got
@@ -220,7 +242,9 @@ def transfer_order_qty_catalog():
                     if not placed: attempt -= 1
 
         if total_issued == 0:
-            return http_error(400, "IGI could not issue any items. Check bin names or let it issue from unallocated.")
+            # include helpful context
+            ctx = {"skus_in_scope": skus_in_scope, "prefer_unallocated": prefer_unallocated, "src_list": src_list}
+            return http_error(400, "IGI could not issue any items. Check bin names or try prefer_unallocated=1.", detail=json.dumps(ctx))
 
         confirm_document(igi_id)
 
@@ -237,7 +261,9 @@ def transfer_order_qty_catalog():
                         "igr_document_id": igr_id,
                         "moved_units": total_issued,
                         "missing": missing,
-                        "sources_used": src_list})
+                        "sources_used": src_list,
+                        "filtered_skus": skus_in_scope,
+                        "prefer_unallocated": prefer_unallocated})
 
     except Exception as e:
         return http_error(500, "Internal error", detail=f"{e}\n{traceback.format_exc()}")
@@ -263,6 +289,27 @@ def catalog_locations_for_sku():
     return jsonify({"product_id": rec["product_id"], "sku": rec.get("sku"),
                     "ean": rec.get("ean"), "locations": rec.get("locations"),
                     "stock": rec.get("stock")})
+
+@app.get("/bl/debug_order_lines")
+def debug_order_lines():
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized")
+    order_id_param = (request.args.get("order_id") or "").strip() or None
+    order_number   = (request.args.get("order_number") or "").strip() or None
+    oid = resolve_order_id(order_id_param, order_number)
+    order = get_order_by_id_strict(oid)
+    items = order.get("products", []) or []
+    out = []
+    for it in items:
+        sku = (it.get("sku") or it.get("product_sku") or "").strip()
+        ean = (it.get("ean") or it.get("product_ean") or "").strip()
+        qty = int(it.get("quantity") or it.get("qty") or 0)
+        rec = resolve_catalog_product_from_order_item(it)
+        pid = rec["product_id"] if rec else None
+        has_loc = bool(rec.get("locations")) if rec else None
+        out.append({"sku": sku, "ean": ean, "qty": qty, "product_id": pid, "has_locations": has_loc})
+    return jsonify({"order_id": oid, "lines": out})
 
 @app.get("/health")
 def health(): return "OK\n"
