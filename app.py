@@ -8,10 +8,28 @@ import csv
 BL_API_URL = "https://api.baselinker.com/connector.php"
 BL_TOKEN = os.environ.get("BL_TOKEN")
 SHARED_KEY = os.environ.get("BL_SHARED_KEY", "")
-WAREHOUSE_ID = "77617"        # your warehouse
+WAREHOUSE_ID = os.environ.get("BL_WAREHOUSE_ID", "77617")  # your warehouse
 TIMEOUT = 30
 
 app = Flask(__name__)
+
+# --- sanity routes ---
+@app.get("/")
+def root():
+    return jsonify({"ok": True, "msg": "root alive"})
+
+@app.get("/health")
+def health():
+    # unmistakable marker so you know this build is live
+    return jsonify({"ok": True, "version": "health v2 - hardcoded"})
+
+@app.get("/__routes")
+def list_routes():
+    output = []
+    for rule in app.url_map.iter_rules():
+        methods = ",".join(sorted(m for m in rule.methods if m not in ("HEAD","OPTIONS")))
+        output.append({"rule": str(rule), "endpoint": rule.endpoint, "methods": methods})
+    return jsonify({"count": len(output), "routes": output})
 
 # ==== Helpers ====
 
@@ -86,8 +104,7 @@ def get_erp_units_for_product(pid: int) -> List[Dict[str, Any]]:
 
 def fetch_last_igr_unit(pid: int, lookback_days: int = 60) -> Optional[Dict[str, Any]]:
     """
-    For setups where ERP units are not exposed by getInventoryProductsData,
-    find the latest IGR (document_type=1) item for this product in this warehouse,
+    Fallback: find the latest IGR (document_type=1) item for this product in this warehouse,
     and return {expiry_date, price, batch}.
     """
     inv_id = require_catalog_id()
@@ -136,10 +153,8 @@ def fetch_fifo_cost(pid: int, location_name: Optional[str] = None, lookback_days
     """
     inv_id = require_catalog_id()
     since = int(time.time()) - lookback_days * 24 * 3600
-
     earliest_any = None
     earliest_in_bin = None
-
     page = 1
     while page <= 50:
         docs = bl_call("getInventoryDocumentsList", {
@@ -171,7 +186,6 @@ def fetch_fifo_cost(pid: int, location_name: Optional[str] = None, lookback_days
             except Exception:
                 pass
         page += 1
-
     if location_name and earliest_in_bin is not None:
         return earliest_in_bin["price"]
     if earliest_any is not None:
@@ -731,6 +745,7 @@ def export_order_csv_v2():
     except Exception as e:
         return http_error(500, "Internal error", detail=f"{e}\n{traceback.format_exc()}")
 
-@app.get("/health")
-def health():
-    return jsonify({"ok": True, "version": "ERP-aware build v1.4 + export FIFO CSV + v2 route"})
+# ---- dev server entrypoint (so `python app.py` works too) ----
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
