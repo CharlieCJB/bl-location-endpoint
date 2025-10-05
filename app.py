@@ -131,7 +131,7 @@ def fetch_last_igr_unit(pid: int, lookback_days: int = 60) -> Optional[Dict[str,
 
 def fetch_fifo_cost(pid: int, location_name: Optional[str] = None, lookback_days: int = 720) -> Optional[str]:
     """
-    FIFO cost = earliest IGR price for this product (optionally filtered by bin name).
+    FIFO price = earliest IGR price for this product (optionally filtered by bin name).
     Returns price as-is (string/number) without rounding; None if not found.
     """
     inv_id = require_catalog_id()
@@ -163,10 +163,8 @@ def fetch_fifo_cost(pid: int, location_name: Optional[str] = None, lookback_days
                         continue
                     price = it.get("price")
                     bin_name = (it.get("location_name") or "").strip()
-                    # track earliest overall
                     if earliest_any is None or stamp < earliest_any["ts"]:
                         earliest_any = {"ts": stamp, "price": price}
-                    # track earliest matching desired bin
                     if location_name and bin_name == location_name:
                         if (earliest_in_bin is None) or (stamp < earliest_in_bin["ts"]):
                             earliest_in_bin = {"ts": stamp, "price": price}
@@ -214,7 +212,7 @@ def get_location_name_by_id(location_id: str) -> Optional[str]:
         pass
     return None
 
-# ==== Transfer helpers (kept for future use) ====
+# ==== Transfer helpers (retained) ====
 
 def build_erp_line_base(pid: int, qty: int, unit: Optional[Dict[str, Any]], bin_name: Optional[str] = None) -> Dict[str, Any]:
     line = {"product_id": pid, "quantity": qty}
@@ -226,7 +224,6 @@ def build_erp_line_base(pid: int, qty: int, unit: Optional[Dict[str, Any]], bin_
     return line
 
 def issue_unallocated(pid: int, qty: int, igi_id: int) -> Tuple[int, List[Dict[str, Any]], str]:
-    """Try: ERP units → last IGR unit → plain. Returns (moved_qty, fail_records, mode_used)."""
     fails = []
     units = get_erp_units_for_product(pid)
     if units:
@@ -306,7 +303,6 @@ def inspect_sku():
 
 @app.get("/bl/seed_erp_unit")
 def seed_erp_unit():
-    """Create & confirm an IGR to seed an ERP unit for a SKU."""
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         return http_error(401, "Unauthorized")
@@ -333,11 +329,10 @@ def seed_erp_unit():
         if expiry:   line["expiry_date"] = expiry
         if price is not None:
             line["price"] = price
-            line["purchase_price"] = price  # some accounts expect this
+            line["purchase_price"] = price
         created, raw = add_items_verbose(igr_id, [line])
         confirm_document(igr_id)
 
-        # read back ERP units immediately
         erp_units_after = get_erp_units_for_product(pid)
 
         return jsonify({
@@ -355,7 +350,6 @@ def seed_erp_unit():
 
 @app.get("/bl/inspect_doc")
 def inspect_doc():
-    """Inspect an inventory document and its items."""
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         return http_error(401, "Unauthorized")
@@ -374,7 +368,6 @@ def inspect_doc():
 
 @app.get("/bl/probe_issue")
 def probe_issue():
-    """DRAFT IGI; try adds with ERP units → last-IGR attrs → plain; does not confirm."""
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         return http_error(401, "Unauthorized")
@@ -401,7 +394,6 @@ def probe_issue():
             created, raw = add_items_verbose(igi_id, [line])
             attempts.append({"mode": mode, "created": bool(created), "response": raw})
 
-        # Unallocated paths
         if erp_units:
             try_line(erp_units[0], None, "unallocated_with_erp")
         else:
@@ -410,7 +402,6 @@ def probe_issue():
             else:
                 try_line(None, None, "unallocated_plain")
 
-        # Each bin paths
         for src in src_list:
             if erp_units:
                 try_line(erp_units[0], src, f"bin_with_erp:{src}")
@@ -427,18 +418,6 @@ def probe_issue():
 
 @app.get("/bl/transfer_order_qty_catalog")
 def transfer_order_qty_catalog():
-    """
-    IGI (3) issue -> bin and/or unallocated (ERP-aware + last-IGR fallback)
-    IGR (1) receipt -> dst bin
-    Query:
-      order_id=... or order_number=...
-      dst_name=InternalStock
-      src_names=BinA,BinB (optional)
-      only_skus=CSV (optional)
-      partial=1
-      prefer_unallocated=1
-      key=...
-    """
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         return http_error(401, "Unauthorized")
@@ -588,16 +567,12 @@ def transfer_order_qty_catalog():
     except Exception as e:
         return http_error(500, "Internal error", detail=str(e))
 
-# ==== NEW: Export order to CSV for manual transfer (FIFO cost, ; separated) ====
+# ==== CSV Exporters ====
 
 @app.get("/bl/export_order_csv")
 def export_order_csv():
     """
-    Download a ; separated CSV for manual import.
-    Columns: SKU;Quantity;Purchase price;Location
-    Defaults: Location = 'Upstairs'
-    Optional: order_id=... or order_number=..., location=CustomName
-    Purchase price is FIFO (earliest IGR price), filtered by Location if possible, else earliest in warehouse.
+    Legacy CSV export (kept for compatibility). If you need strict format, use /bl/export_order_csv_v2.
     """
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
@@ -654,7 +629,6 @@ def export_order_csv():
             sku = (it.get("sku") or it.get("product_sku") or "").strip()
             qty = to_int_local(it.get("quantity") or it.get("qty"))
 
-            # get product_id and FIFO price from earliest IGR (optionally for this bin)
             price_str = ""
             if sku:
                 rec = find_catalog_product(sku=sku)
@@ -662,7 +636,6 @@ def export_order_csv():
                     pid = int(rec["product_id"])
                     fifo_price = fetch_fifo_cost(pid, location_name=default_loc)
                     if fifo_price is not None and fifo_price != "":
-                        # write as-is (no rounding)
                         price_str = str(fifo_price)
 
             writer.writerow([sku, qty, price_str, default_loc])
@@ -675,6 +648,89 @@ def export_order_csv():
     except Exception as e:
         return http_error(500, "Internal error", detail=f"{e}\n{traceback.format_exc()}")
 
+@app.get("/bl/export_order_csv_v2")
+def export_order_csv_v2():
+    """
+    V2: Fixed format (semicolon CSV)
+    Columns: SKU;Quantity;Purchase price;Location
+    FIFO price (earliest IGR price). Location defaults to 'Upstairs' (override ?location=).
+    """
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized")
+
+    order_id_param = (request.args.get("order_id") or "").strip() or None
+    order_number   = (request.args.get("order_number") or "").strip() or None
+    default_loc    = (request.args.get("location") or "").strip() or "Upstairs"
+
+    def to_int_local(x):
+        try: return int(x or 0)
+        except: return 0
+
+    def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
+        if order_id:
+            return str(order_id).strip()
+        if not order_number:
+            raise ValueError("Provide order_id or order_number")
+        needle = str(order_number).strip()
+        date_from = int(time.time()) - 60 * 24 * 60 * 60
+        matches, page = [], 1
+        while page <= 300:
+            resp = bl_call("getOrders", {"date_from": date_from, "get_unconfirmed_orders": True, "page": page})
+            rows = resp.get("orders", []) or []
+            if not rows: break
+            for o in rows:
+                o_num = str(o.get("order_number", "")).strip()
+                o_id  = str(o.get("order_id", "")).strip()
+                if (o_num and o_num == needle) or (not o_num and o_id == needle):
+                    matches.append(o)
+            page += 1
+        if not matches:
+            raise LookupError(f"Order with order_number/id '{order_number}' not found")
+        matches.sort(key=lambda o: (to_int_local(o.get("date_add")), to_int_local(o.get("order_id"))), reverse=True)
+        return str(matches[0].get("order_id"))
+
+    try:
+        oid = resolve_order_id(order_id_param, order_number)
+        order_resp = bl_call("getOrders", {"order_id": oid, "get_unconfirmed_orders": True})
+        orders = order_resp.get("orders", []) or []
+        if not orders:
+            return http_error(404, f"Order not found: {oid}")
+        order = orders[0]
+
+        lines = order.get("products", []) or []
+        if not lines:
+            return http_error(400, "Order has no products")
+
+        def fifo_price_for_sku(sku: str) -> Optional[str]:
+            rec = find_catalog_product(sku=sku)
+            if not rec:
+                return None
+            pid = int(rec["product_id"])
+            return fetch_fifo_cost(pid, location_name=default_loc)
+
+        buf = StringIO()
+        writer = csv.writer(buf, delimiter=';')
+        writer.writerow(["SKU", "Quantity", "Purchase price", "Location"])
+
+        for it in lines:
+            sku = (it.get("sku") or it.get("product_sku") or "").strip()
+            qty = to_int_local(it.get("quantity") or it.get("qty"))
+            price_str = ""
+            if sku:
+                p = fifo_price_for_sku(sku)
+                if p is not None and p != "":
+                    price_str = str(p)  # no rounding
+            writer.writerow([sku, qty, price_str, default_loc])
+
+        resp = make_response(buf.getvalue())
+        resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+        resp.headers["Content-Disposition"] = f"attachment; filename=order_{oid}_for_transfer_v2.csv"
+        return resp
+
+    except Exception as e:
+        return http_error(500, "Internal error", detail=f"{e}\n{traceback.format_exc()}")
+
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "version": "ERP-aware build v1.4 + export FIFO CSV"})
+    return jsonify({"ok": True, "version": "ERP-aware build v1.4 + export FIFO CSV + v2 route"})
