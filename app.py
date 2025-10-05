@@ -129,6 +129,57 @@ def fetch_last_igr_unit(pid: int, lookback_days: int = 60) -> Optional[Dict[str,
         return {"expiry_date": latest["expiry_date"], "price": latest["price"], "batch": latest["batch"]}
     return None
 
+def fetch_fifo_cost(pid: int, location_name: Optional[str] = None, lookback_days: int = 720) -> Optional[str]:
+    """
+    FIFO cost = earliest IGR price for this product (optionally filtered by bin name).
+    Returns price as-is (string/number) without rounding; None if not found.
+    """
+    inv_id = require_catalog_id()
+    since = int(time.time()) - lookback_days * 24 * 3600
+
+    earliest_any = None
+    earliest_in_bin = None
+
+    page = 1
+    while page <= 50:
+        docs = bl_call("getInventoryDocumentsList", {
+            "inventory_id": inv_id,
+            "warehouse_id": int(WAREHOUSE_ID),
+            "date_from": since,
+            "page": page
+        })
+        rows = docs.get("documents", []) or []
+        if not rows:
+            break
+        for d in rows:
+            try:
+                if int(d.get("document_type")) != 1:  # IGR only
+                    continue
+                doc_id = int(d.get("document_id"))
+                stamp = to_int(d.get("date_add") or d.get("date") or 0)
+                items = bl_call("getInventoryDocumentItems", {"document_id": doc_id})
+                for it in (items.get("items") or []):
+                    if int(it.get("product_id", 0)) != int(pid):
+                        continue
+                    price = it.get("price")
+                    bin_name = (it.get("location_name") or "").strip()
+                    # track earliest overall
+                    if earliest_any is None or stamp < earliest_any["ts"]:
+                        earliest_any = {"ts": stamp, "price": price}
+                    # track earliest matching desired bin
+                    if location_name and bin_name == location_name:
+                        if (earliest_in_bin is None) or (stamp < earliest_in_bin["ts"]):
+                            earliest_in_bin = {"ts": stamp, "price": price}
+            except Exception:
+                pass
+        page += 1
+
+    if location_name and earliest_in_bin is not None:
+        return earliest_in_bin["price"]
+    if earliest_any is not None:
+        return earliest_any["price"]
+    return None
+
 # ==== Inventory documents ====
 
 def create_document(document_type: int, warehouse_id: int) -> int:
@@ -163,7 +214,7 @@ def get_location_name_by_id(location_id: str) -> Optional[str]:
         pass
     return None
 
-# ==== Transfer helpers ====
+# ==== Transfer helpers (kept for future use) ====
 
 def build_erp_line_base(pid: int, qty: int, unit: Optional[Dict[str, Any]], bin_name: Optional[str] = None) -> Dict[str, Any]:
     line = {"product_id": pid, "quantity": qty}
@@ -537,20 +588,16 @@ def transfer_order_qty_catalog():
     except Exception as e:
         return http_error(500, "Internal error", detail=str(e))
 
-# ==== NEW: Export order to CSV for manual transfer ====
+# ==== NEW: Export order to CSV for manual transfer (FIFO cost, ; separated) ====
 
 @app.get("/bl/export_order_csv")
 def export_order_csv():
     """
-    Download a CSV with the order's line items for manual internal transfer.
-    Usage:
-      /bl/export_order_csv?order_id=12345678&key=YOUR_SHARED_KEY
-      or
-      /bl/export_order_csv?order_number=21123456&key=YOUR_SHARED_KEY
-
-    Optional flags:
-      include_bins=1           -> tries to suggest the first catalog location/bin (if available)
-      dst_name=InternalStock   -> destination bin name in CSV (default: InternalStock)
+    Download a ; separated CSV for manual import.
+    Columns: SKU;Quantity;Purchase price;Location
+    Defaults: Location = 'Upstairs'
+    Optional: order_id=... or order_number=..., location=CustomName
+    Purchase price is FIFO (earliest IGR price), filtered by Location if possible, else earliest in warehouse.
     """
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
@@ -558,8 +605,7 @@ def export_order_csv():
 
     order_id_param = (request.args.get("order_id") or "").strip() or None
     order_number   = (request.args.get("order_number") or "").strip() or None
-    include_bins   = (request.args.get("include_bins") or "").strip().lower() in ("1","true","yes")
-    dst_name       = (request.args.get("dst_name") or "").strip() or "InternalStock"
+    default_loc    = (request.args.get("location") or "").strip() or "Upstairs"
 
     def to_int_local(x):
         try: return int(x or 0)
@@ -588,13 +634,6 @@ def export_order_csv():
         matches.sort(key=lambda o: (to_int_local(o.get("date_add")), to_int_local(o.get("order_id"))), reverse=True)
         return str(matches[0].get("order_id"))
 
-    def catalog_lookup_for_sku(sku: str):
-        try:
-            rec = find_catalog_product(sku=sku, include=["locations","stock"])
-            return rec
-        except:
-            return None
-
     try:
         oid = resolve_order_id(order_id_param, order_number)
         order_resp = bl_call("getOrders", {"order_id": oid, "get_unconfirmed_orders": True})
@@ -608,55 +647,29 @@ def export_order_csv():
             return http_error(400, "Order has no products")
 
         buf = StringIO()
-        writer = csv.writer(buf)
-        writer.writerow([
-            "OrderID",
-            "SKU",
-            "EAN",
-            "Product Name",
-            "Qty to Move",
-            "Catalog Product ID",
-            "Suggested Src Bin",
-            "Dst Bin",
-            "Warehouse ID"
-        ])
+        writer = csv.writer(buf, delimiter=';')
+        writer.writerow(["SKU", "Quantity", "Purchase price", "Location"])
 
         for it in lines:
             sku = (it.get("sku") or it.get("product_sku") or "").strip()
-            ean = (it.get("ean") or it.get("product_ean") or "").strip()
-            name = (it.get("name") or it.get("product_name") or "").strip()
-            qty  = to_int_local(it.get("quantity") or it.get("qty"))
+            qty = to_int_local(it.get("quantity") or it.get("qty"))
 
-            pid = ""
-            src_bin = ""
+            # get product_id and FIFO price from earliest IGR (optionally for this bin)
+            price_str = ""
             if sku:
-                rec = catalog_lookup_for_sku(sku)
+                rec = find_catalog_product(sku=sku)
                 if rec:
-                    pid = str(rec.get("product_id") or "")
-                    if include_bins:
-                        locs = rec.get("locations")
-                        if isinstance(locs, list) and locs:
-                            for loc in locs:
-                                n = (loc.get("name") or "").strip()
-                                if n:
-                                    src_bin = n
-                                    break
+                    pid = int(rec["product_id"])
+                    fifo_price = fetch_fifo_cost(pid, location_name=default_loc)
+                    if fifo_price is not None and fifo_price != "":
+                        # write as-is (no rounding)
+                        price_str = str(fifo_price)
 
-            writer.writerow([
-                oid,
-                sku,
-                ean,
-                name,
-                qty,
-                pid,
-                src_bin,
-                dst_name,
-                WAREHOUSE_ID
-            ])
+            writer.writerow([sku, qty, price_str, default_loc])
 
         resp = make_response(buf.getvalue())
-        resp.headers["Content-Type"] = "text/csv"
-        resp.headers["Content-Disposition"] = f"attachment; filename=order_{oid}_transfer.csv"
+        resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+        resp.headers["Content-Disposition"] = f"attachment; filename=order_{oid}_for_transfer.csv"
         return resp
 
     except Exception as e:
@@ -664,4 +677,4 @@ def export_order_csv():
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "version": "ERP-aware build v1.3 + export_order_csv"})
+    return jsonify({"ok": True, "version": "ERP-aware build v1.4 + export FIFO CSV"})
