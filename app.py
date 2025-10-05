@@ -82,6 +82,54 @@ def get_erp_units_for_product(pid: int) -> List[Dict[str, Any]]:
     norm.sort(key=lambda u: (u["expiry_date"] or "9999-12-31"))
     return norm
 
+def fetch_last_igr_unit(pid: int, lookback_days: int = 60) -> Optional[Dict[str, Any]]:
+    """
+    For setups where ERP units are not exposed by getInventoryProductsData,
+    find the latest IGR (document_type=1) item for this product in this warehouse,
+    and return {expiry_date, price, batch}.
+    """
+    inv_id = require_catalog_id()
+    since = int(time.time()) - lookback_days * 24 * 3600
+    # get recent documents list (we’ll scan pages if needed)
+    page = 1
+    latest = None
+    while page <= 10:
+        docs = bl_call("getInventoryDocumentsList", {
+            "inventory_id": inv_id,
+            "warehouse_id": int(WAREHOUSE_ID),
+            "date_from": since,
+            "page": page
+        })
+        rows = docs.get("documents", []) or []
+        if not rows:
+            break
+        for d in rows:
+            try:
+                if int(d.get("document_type")) != 1:  # IGR
+                    continue
+                doc_id = int(d.get("document_id"))
+                # fetch items for this doc
+                items = bl_call("getInventoryDocumentItems", {"document_id": doc_id})
+                for it in (items.get("items") or []):
+                    if int(it.get("product_id", 0)) == int(pid):
+                        # candidate found; pick the most recent by document date
+                        stamp = to_int(d.get("date_add") or d.get("date"))
+                        rec = {
+                            "doc_id": doc_id,
+                            "ts": stamp,
+                            "expiry_date": it.get("expiry_date"),
+                            "price": it.get("price"),
+                            "batch": it.get("batch") or "",
+                        }
+                        if (latest is None) or (rec["ts"] > latest["ts"]):
+                            latest = rec
+            except Exception:
+                pass
+        page += 1
+    if latest:
+        return {"expiry_date": latest["expiry_date"], "price": latest["price"], "batch": latest["batch"]}
+    return None
+
 # ==== Inventory documents ====
 
 def create_document(document_type: int, warehouse_id: int) -> int:
@@ -118,9 +166,19 @@ def get_location_name_by_id(location_id: str) -> Optional[str]:
 
 # ==== Transfer helpers ====
 
-def issue_unallocated(pid: int, qty: int, igi_id: int) -> Tuple[int, List[Dict[str, Any]]]:
-    """Try to issue qty from unallocated, ERP-aware. Returns (moved_qty, fail_records)."""
+def build_erp_line_base(pid: int, qty: int, unit: Optional[Dict[str, Any]], bin_name: Optional[str] = None) -> Dict[str, Any]:
+    line = {"product_id": pid, "quantity": qty}
+    if bin_name: line["location_name"] = bin_name
+    if unit:
+        if unit.get("expiry_date"): line["expiry_date"] = unit["expiry_date"]
+        if unit.get("price") is not None: line["price"] = unit["price"]
+        if unit.get("batch"): line["batch"] = unit["batch"]
+    return line
+
+def issue_unallocated(pid: int, qty: int, igi_id: int) -> Tuple[int, List[Dict[str, Any]], str]:
+    """Try: ERP units → last IGR unit → plain. Returns (moved_qty, fail_records, mode_used)."""
     fails = []
+    # 1) official ERP units
     units = get_erp_units_for_product(pid)
     if units:
         remaining, moved = qty, 0
@@ -128,27 +186,31 @@ def issue_unallocated(pid: int, qty: int, igi_id: int) -> Tuple[int, List[Dict[s
             if remaining <= 0: break
             take = min(remaining, to_int(u["qty"]))
             if take <= 0: continue
-            line = {"product_id": pid, "quantity": take}
-            if u.get("expiry_date"): line["expiry_date"] = u["expiry_date"]
-            if u.get("price") is not None: line["price"] = u["price"]
-            if u.get("batch"): line["batch"] = u["batch"]
-            created, raw = add_items_verbose(igi_id, [line])
+            created, raw = add_items_verbose(igi_id, [build_erp_line_base(pid, take, u)])
             if created:
-                moved += take
-                remaining -= take
+                moved += take; remaining -= take
             else:
                 fails.append({"product_id": pid, "attempt_qty": take, "src": None, "erp_unit": u, "response": raw})
                 break
-        return moved, fails
-    # fallback: plain
+        if moved:
+            return moved, fails, "unallocated_with_erp"
+    # 2) last IGR unit attributes
+    last = fetch_last_igr_unit(pid)
+    if last:
+        created, raw = add_items_verbose(igi_id, [build_erp_line_base(pid, qty, last)])
+        if created:
+            return qty, fails, "unallocated_with_last_igr"
+        fails.append({"product_id": pid, "attempt_qty": qty, "src": None, "last_igr": last, "response": raw})
+    # 3) plain
     created, raw = add_items_verbose(igi_id, [{"product_id": pid, "quantity": qty}])
     if created:
-        return qty, []
+        return qty, fails, "unallocated_plain"
     fails.append({"product_id": pid, "attempt_qty": qty, "src": None, "response": raw})
-    return 0, fails
+    return 0, fails, "unallocated_failed"
 
-def issue_from_bin(pid: int, qty: int, bin_name: str, igi_id: int) -> Tuple[int, List[Dict[str, Any]]]:
+def issue_from_bin(pid: int, qty: int, bin_name: str, igi_id: int) -> Tuple[int, List[Dict[str, Any]], str]:
     fails = []
+    # 1) ERP units
     units = get_erp_units_for_product(pid)
     if units:
         remaining, moved = qty, 0
@@ -156,25 +218,27 @@ def issue_from_bin(pid: int, qty: int, bin_name: str, igi_id: int) -> Tuple[int,
             if remaining <= 0: break
             take = min(remaining, to_int(u["qty"]))
             if take <= 0: continue
-            line = {"product_id": pid, "quantity": take, "location_name": bin_name}
-            if u.get("expiry_date"): line["expiry_date"] = u["expiry_date"]
-            if u.get("price") is not None: line["price"] = u["price"]
-            if u.get("batch"): line["batch"] = u["batch"]
-            created, raw = add_items_verbose(igi_id, [line])
+            created, raw = add_items_verbose(igi_id, [build_erp_line_base(pid, take, u, bin_name)])
             if created:
-                moved += take
-                remaining -= take
+                moved += take; remaining -= take
             else:
                 fails.append({"product_id": pid, "attempt_qty": take, "src": bin_name, "erp_unit": u, "response": raw})
                 break
-        if moved: return moved, fails
-        # if none moved with ERP, try plain (some setups allow)
-    line = {"product_id": pid, "quantity": qty, "location_name": bin_name}
-    created, raw = add_items_verbose(igi_id, [line])
+        if moved:
+            return moved, fails, "bin_with_erp"
+    # 2) last IGR unit attributes
+    last = fetch_last_igr_unit(pid)
+    if last:
+        created, raw = add_items_verbose(igi_id, [build_erp_line_base(pid, qty, last, bin_name)])
+        if created:
+            return qty, fails, "bin_with_last_igr"
+        fails.append({"product_id": pid, "attempt_qty": qty, "src": bin_name, "last_igr": last, "response": raw})
+    # 3) plain
+    created, raw = add_items_verbose(igi_id, [{"product_id": pid, "quantity": qty, "location_name": bin_name}])
     if created:
-        return qty, []
+        return qty, fails, "bin_plain"
     fails.append({"product_id": pid, "attempt_qty": qty, "src": bin_name, "response": raw})
-    return 0, fails
+    return 0, fails, "bin_failed"
 
 # ==== ROUTES ====
 
@@ -266,7 +330,7 @@ def inspect_doc():
 
 @app.get("/bl/probe_issue")
 def probe_issue():
-    """DRAFT IGI; try adds with ERP attrs if available; does not confirm."""
+    """DRAFT IGI; try adds with ERP units, then last-IGR attrs, then plain; does not confirm."""
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         return http_error(401, "Unauthorized")
@@ -283,46 +347,44 @@ def probe_issue():
             return http_error(404, f"SKU {sku} not found")
         pid = rec["product_id"]
         erp_units = get_erp_units_for_product(pid)
+        last_igr = fetch_last_igr_unit(pid)
 
         igi_id = create_document(3, int(WAREHOUSE_ID))
         attempts = []
 
-        def make_line(unit=None, bin_name=None):
-            line = {"product_id": pid, "quantity": 1}
-            if bin_name:
-                line["location_name"] = bin_name
-            if unit:
-                if unit.get("expiry_date"): line["expiry_date"] = unit["expiry_date"]
-                if unit.get("price") is not None: line["price"] = unit["price"]
-                if unit.get("batch"): line["batch"] = unit["batch"]
-            return line
+        def try_line(unit=None, bin_name=None, mode=""):
+            line = build_erp_line_base(pid, 1, unit, bin_name)
+            created, raw = add_items_verbose(igi_id, [line])
+            attempts.append({"mode": mode, "created": bool(created), "response": raw})
 
-        # Unallocated
+        # Unallocated paths
         if erp_units:
-            created, raw = add_items_verbose(igi_id, [make_line(erp_units[0])])
-            attempts.append({"mode": "unallocated_with_erp", "created": bool(created), "response": raw})
+            try_line(erp_units[0], None, "unallocated_with_erp")
         else:
-            created, raw = add_items_verbose(igi_id, [make_line()])
-            attempts.append({"mode": "unallocated_plain", "created": bool(created), "response": raw})
+            if last_igr:
+                try_line(last_igr, None, "unallocated_with_last_igr")
+            else:
+                try_line(None, None, "unallocated_plain")
 
-        # Each bin
+        # Each bin paths
         for src in src_list:
             if erp_units:
-                created, raw = add_items_verbose(igi_id, [make_line(erp_units[0], src)])
-                attempts.append({"mode": f"bin_with_erp:{src}", "created": bool(created), "response": raw})
+                try_line(erp_units[0], src, f"bin_with_erp:{src}")
             else:
-                created, raw = add_items_verbose(igi_id, [make_line(None, src)])
-                attempts.append({"mode": f"bin_plain:{src}", "created": bool(created), "response": raw})
+                if last_igr:
+                    try_line(last_igr, src, f"bin_with_last_igr:{src}")
+                else:
+                    try_line(None, src, f"bin_plain:{src}")
 
         return jsonify({"sku": sku, "product_id": pid, "erp_units_seen": erp_units,
-                        "draft_igi_id": igi_id, "attempts": attempts})
+                        "last_igr_unit": last_igr, "draft_igi_id": igi_id, "attempts": attempts})
     except Exception as e:
-        return http_error(500, "Internal error", detail=f"{e}\n{traceback.format_exc()}")
+        return http_error(500, "Internal error", detail=str(e))
 
 @app.get("/bl/transfer_order_qty_catalog")
 def transfer_order_qty_catalog():
     """
-    IGI (3) issue -> bin and/or unallocated (ERP-aware)
+    IGI (3) issue -> bin and/or unallocated (ERP-aware + last-IGR fallback)
     IGR (1) receipt -> dst bin
     Query:
       order_id=... or order_number=...
@@ -353,7 +415,6 @@ def transfer_order_qty_catalog():
         dst_name = get_location_name_by_id(dst_loc_id) if dst_loc_id else None
     if not dst_name:
         return http_error(400, "Destination not found. Use dst_name=<bin name>.")
-
     if not src_list and not prefer_unalloc:
         return http_error(400, "Specify src_names or set prefer_unallocated=1")
 
@@ -412,48 +473,53 @@ def transfer_order_qty_catalog():
         issued_per_product: Dict[int, int] = {}
         total_issued = 0
         fail_reasons: List[Dict[str, Any]] = []
+        modes_used: Dict[int, str] = {}
 
         for line in base_lines:
             pid, remaining = line["product_id"], line["qty"]
 
             # unallocated first (if set)
             if prefer_unalloc and remaining > 0:
-                moved, fails = issue_unallocated(pid, remaining, igi_id)
+                moved, fails, mode = issue_unallocated(pid, remaining, igi_id)
                 if moved:
                     issued_per_product[pid] = issued_per_product.get(pid, 0) + moved
                     total_issued += moved
                     remaining -= moved
+                    modes_used[pid] = mode
                 fail_reasons.extend(fails)
 
             # then bins
             if remaining > 0 and src_list:
                 for src in src_list:
                     if remaining <= 0: break
-                    moved, fails = issue_from_bin(pid, remaining, src, igi_id)
+                    moved, fails, mode = issue_from_bin(pid, remaining, src, igi_id)
                     if moved:
                         issued_per_product[pid] = issued_per_product.get(pid, 0) + moved
                         total_issued += moved
                         remaining -= moved
+                        modes_used[pid] = mode
                         break
                     fail_reasons.extend(fails)
 
             # fallback to unallocated if product has no explicit locations
             if remaining > 0 and not prefer_unalloc:
-                moved, fails = issue_unallocated(pid, remaining, igi_id)
+                moved, fails, mode = issue_unallocated(pid, remaining, igi_id)
                 if moved:
                     issued_per_product[pid] = issued_per_product.get(pid, 0) + moved
                     total_issued += moved
                     remaining -= moved
+                    modes_used[pid] = mode
                 fail_reasons.extend(fails)
 
-            # optional partial nibble (very basic)
+            # optional partial nibble
             if remaining > 0 and partial:
                 attempt = max(1, remaining // 2)
-                got, fails = issue_unallocated(pid, attempt, igi_id)
-                if got:
-                    issued_per_product[pid] = issued_per_product.get(pid, 0) + got
-                    total_issued += got
-                    remaining -= got
+                moved, fails, mode = issue_unallocated(pid, attempt, igi_id)
+                if moved:
+                    issued_per_product[pid] = issued_per_product.get(pid, 0) + moved
+                    total_issued += moved
+                    remaining -= moved
+                    modes_used[pid] = mode
                 else:
                     fail_reasons.extend(fails)
 
@@ -487,11 +553,12 @@ def transfer_order_qty_catalog():
             "missing": missing,
             "sources_used": src_list,
             "filtered_skus": skus_in_scope,
-            "prefer_unallocated": prefer_unalloc
+            "prefer_unallocated": prefer_unalloc,
+            "modes_used": modes_used
         })
     except Exception as e:
-        return http_error(500, "Internal error", detail=f"{e}\n{traceback.format_exc()}")
+        return http_error(500, "Internal error", detail=str(e))
 
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "version": "ERP-aware build v1.2"})
+    return jsonify({"ok": True, "version": "ERP-aware build v1.3 (last-IGR fallback)"})
