@@ -1,6 +1,8 @@
 import os, json, traceback, requests, time
 from flask import Flask, request, jsonify, make_response
 from typing import List, Dict, Any, Optional, Tuple
+from io import StringIO
+import csv
 
 # ==== Config ====
 BL_API_URL = "https://api.baselinker.com/connector.php"
@@ -90,7 +92,6 @@ def fetch_last_igr_unit(pid: int, lookback_days: int = 60) -> Optional[Dict[str,
     """
     inv_id = require_catalog_id()
     since = int(time.time()) - lookback_days * 24 * 3600
-    # get recent documents list (we’ll scan pages if needed)
     page = 1
     latest = None
     while page <= 10:
@@ -108,11 +109,9 @@ def fetch_last_igr_unit(pid: int, lookback_days: int = 60) -> Optional[Dict[str,
                 if int(d.get("document_type")) != 1:  # IGR
                     continue
                 doc_id = int(d.get("document_id"))
-                # fetch items for this doc
                 items = bl_call("getInventoryDocumentItems", {"document_id": doc_id})
                 for it in (items.get("items") or []):
                     if int(it.get("product_id", 0)) == int(pid):
-                        # candidate found; pick the most recent by document date
                         stamp = to_int(d.get("date_add") or d.get("date"))
                         rec = {
                             "doc_id": doc_id,
@@ -178,7 +177,6 @@ def build_erp_line_base(pid: int, qty: int, unit: Optional[Dict[str, Any]], bin_
 def issue_unallocated(pid: int, qty: int, igi_id: int) -> Tuple[int, List[Dict[str, Any]], str]:
     """Try: ERP units → last IGR unit → plain. Returns (moved_qty, fail_records, mode_used)."""
     fails = []
-    # 1) official ERP units
     units = get_erp_units_for_product(pid)
     if units:
         remaining, moved = qty, 0
@@ -194,14 +192,12 @@ def issue_unallocated(pid: int, qty: int, igi_id: int) -> Tuple[int, List[Dict[s
                 break
         if moved:
             return moved, fails, "unallocated_with_erp"
-    # 2) last IGR unit attributes
     last = fetch_last_igr_unit(pid)
     if last:
         created, raw = add_items_verbose(igi_id, [build_erp_line_base(pid, qty, last)])
         if created:
             return qty, fails, "unallocated_with_last_igr"
         fails.append({"product_id": pid, "attempt_qty": qty, "src": None, "last_igr": last, "response": raw})
-    # 3) plain
     created, raw = add_items_verbose(igi_id, [{"product_id": pid, "quantity": qty}])
     if created:
         return qty, fails, "unallocated_plain"
@@ -210,7 +206,6 @@ def issue_unallocated(pid: int, qty: int, igi_id: int) -> Tuple[int, List[Dict[s
 
 def issue_from_bin(pid: int, qty: int, bin_name: str, igi_id: int) -> Tuple[int, List[Dict[str, Any]], str]:
     fails = []
-    # 1) ERP units
     units = get_erp_units_for_product(pid)
     if units:
         remaining, moved = qty, 0
@@ -226,21 +221,19 @@ def issue_from_bin(pid: int, qty: int, bin_name: str, igi_id: int) -> Tuple[int,
                 break
         if moved:
             return moved, fails, "bin_with_erp"
-    # 2) last IGR unit attributes
     last = fetch_last_igr_unit(pid)
     if last:
         created, raw = add_items_verbose(igi_id, [build_erp_line_base(pid, qty, last, bin_name)])
         if created:
             return qty, fails, "bin_with_last_igr"
         fails.append({"product_id": pid, "attempt_qty": qty, "src": bin_name, "last_igr": last, "response": raw})
-    # 3) plain
     created, raw = add_items_verbose(igi_id, [{"product_id": pid, "quantity": qty, "location_name": bin_name}])
     if created:
         return qty, fails, "bin_plain"
     fails.append({"product_id": pid, "attempt_qty": qty, "src": bin_name, "response": raw})
     return 0, fails, "bin_failed"
 
-# ==== ROUTES ====
+# ==== ROUTES (inspect / seed / inspect_doc / probe / transfer) ====
 
 @app.get("/bl/inspect_sku")
 def inspect_sku():
@@ -330,7 +323,7 @@ def inspect_doc():
 
 @app.get("/bl/probe_issue")
 def probe_issue():
-    """DRAFT IGI; try adds with ERP units, then last-IGR attrs, then plain; does not confirm."""
+    """DRAFT IGI; try adds with ERP units → last-IGR attrs → plain; does not confirm."""
     supplied = request.args.get("key") or request.headers.get("X-App-Key")
     if SHARED_KEY and supplied != SHARED_KEY:
         return http_error(401, "Unauthorized")
@@ -418,7 +411,6 @@ def transfer_order_qty_catalog():
     if not src_list and not prefer_unalloc:
         return http_error(400, "Specify src_names or set prefer_unallocated=1")
 
-    # resolve order_id
     def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
         if order_id: return str(order_id).strip()
         if not order_number: raise ValueError("Provide order_id or order_number")
@@ -468,7 +460,6 @@ def transfer_order_qty_catalog():
         if not base_lines:
             return http_error(400, f"No transferrable items. Missing: {missing}, only_skus={only_skus}")
 
-        # IGI
         igi_id = create_document(3, int(WAREHOUSE_ID))
         issued_per_product: Dict[int, int] = {}
         total_issued = 0
@@ -478,7 +469,6 @@ def transfer_order_qty_catalog():
         for line in base_lines:
             pid, remaining = line["product_id"], line["qty"]
 
-            # unallocated first (if set)
             if prefer_unalloc and remaining > 0:
                 moved, fails, mode = issue_unallocated(pid, remaining, igi_id)
                 if moved:
@@ -488,7 +478,6 @@ def transfer_order_qty_catalog():
                     modes_used[pid] = mode
                 fail_reasons.extend(fails)
 
-            # then bins
             if remaining > 0 and src_list:
                 for src in src_list:
                     if remaining <= 0: break
@@ -501,7 +490,6 @@ def transfer_order_qty_catalog():
                         break
                     fail_reasons.extend(fails)
 
-            # fallback to unallocated if product has no explicit locations
             if remaining > 0 and not prefer_unalloc:
                 moved, fails, mode = issue_unallocated(pid, remaining, igi_id)
                 if moved:
@@ -511,17 +499,8 @@ def transfer_order_qty_catalog():
                     modes_used[pid] = mode
                 fail_reasons.extend(fails)
 
-            # optional partial nibble
-            if remaining > 0 and partial:
-                attempt = max(1, remaining // 2)
-                moved, fails, mode = issue_unallocated(pid, attempt, igi_id)
-                if moved:
-                    issued_per_product[pid] = issued_per_product.get(pid, 0) + moved
-                    total_issued += moved
-                    remaining -= moved
-                    modes_used[pid] = mode
-                else:
-                    fail_reasons.extend(fails)
+            if remaining > 0:
+                fail_reasons.append({"product_id": pid, "remaining_unissued": remaining})
 
         if total_issued == 0:
             ctx = {
@@ -535,7 +514,6 @@ def transfer_order_qty_catalog():
 
         confirm_document(igi_id)
 
-        # IGR
         igr_id = create_document(1, int(WAREHOUSE_ID))
         igr_lines = [{"product_id": pid, "quantity": qty, "location_name": dst_name}
                      for pid, qty in issued_per_product.items() if qty > 0]
@@ -559,6 +537,131 @@ def transfer_order_qty_catalog():
     except Exception as e:
         return http_error(500, "Internal error", detail=str(e))
 
+# ==== NEW: Export order to CSV for manual transfer ====
+
+@app.get("/bl/export_order_csv")
+def export_order_csv():
+    """
+    Download a CSV with the order's line items for manual internal transfer.
+    Usage:
+      /bl/export_order_csv?order_id=12345678&key=YOUR_SHARED_KEY
+      or
+      /bl/export_order_csv?order_number=21123456&key=YOUR_SHARED_KEY
+
+    Optional flags:
+      include_bins=1           -> tries to suggest the first catalog location/bin (if available)
+      dst_name=InternalStock   -> destination bin name in CSV (default: InternalStock)
+    """
+    supplied = request.args.get("key") or request.headers.get("X-App-Key")
+    if SHARED_KEY and supplied != SHARED_KEY:
+        return http_error(401, "Unauthorized")
+
+    order_id_param = (request.args.get("order_id") or "").strip() or None
+    order_number   = (request.args.get("order_number") or "").strip() or None
+    include_bins   = (request.args.get("include_bins") or "").strip().lower() in ("1","true","yes")
+    dst_name       = (request.args.get("dst_name") or "").strip() or "InternalStock"
+
+    def to_int_local(x):
+        try: return int(x or 0)
+        except: return 0
+
+    def resolve_order_id(order_id: Optional[str], order_number: Optional[str]) -> str:
+        if order_id:
+            return str(order_id).strip()
+        if not order_number:
+            raise ValueError("Provide order_id or order_number")
+        needle = str(order_number).strip()
+        date_from = int(time.time()) - 60 * 24 * 60 * 60
+        matches, page = [], 1
+        while page <= 300:
+            resp = bl_call("getOrders", {"date_from": date_from, "get_unconfirmed_orders": True, "page": page})
+            rows = resp.get("orders", []) or []
+            if not rows: break
+            for o in rows:
+                o_num = str(o.get("order_number", "")).strip()
+                o_id  = str(o.get("order_id", "")).strip()
+                if (o_num and o_num == needle) or (not o_num and o_id == needle):
+                    matches.append(o)
+            page += 1
+        if not matches:
+            raise LookupError(f"Order with order_number/id '{order_number}' not found")
+        matches.sort(key=lambda o: (to_int_local(o.get("date_add")), to_int_local(o.get("order_id"))), reverse=True)
+        return str(matches[0].get("order_id"))
+
+    def catalog_lookup_for_sku(sku: str):
+        try:
+            rec = find_catalog_product(sku=sku, include=["locations","stock"])
+            return rec
+        except:
+            return None
+
+    try:
+        oid = resolve_order_id(order_id_param, order_number)
+        order_resp = bl_call("getOrders", {"order_id": oid, "get_unconfirmed_orders": True})
+        orders = order_resp.get("orders", []) or []
+        if not orders:
+            return http_error(404, f"Order not found: {oid}")
+        order = orders[0]
+
+        lines = order.get("products", []) or []
+        if not lines:
+            return http_error(400, "Order has no products")
+
+        buf = StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "OrderID",
+            "SKU",
+            "EAN",
+            "Product Name",
+            "Qty to Move",
+            "Catalog Product ID",
+            "Suggested Src Bin",
+            "Dst Bin",
+            "Warehouse ID"
+        ])
+
+        for it in lines:
+            sku = (it.get("sku") or it.get("product_sku") or "").strip()
+            ean = (it.get("ean") or it.get("product_ean") or "").strip()
+            name = (it.get("name") or it.get("product_name") or "").strip()
+            qty  = to_int_local(it.get("quantity") or it.get("qty"))
+
+            pid = ""
+            src_bin = ""
+            if sku:
+                rec = catalog_lookup_for_sku(sku)
+                if rec:
+                    pid = str(rec.get("product_id") or "")
+                    if include_bins:
+                        locs = rec.get("locations")
+                        if isinstance(locs, list) and locs:
+                            for loc in locs:
+                                n = (loc.get("name") or "").strip()
+                                if n:
+                                    src_bin = n
+                                    break
+
+            writer.writerow([
+                oid,
+                sku,
+                ean,
+                name,
+                qty,
+                pid,
+                src_bin,
+                dst_name,
+                WAREHOUSE_ID
+            ])
+
+        resp = make_response(buf.getvalue())
+        resp.headers["Content-Type"] = "text/csv"
+        resp.headers["Content-Disposition"] = f"attachment; filename=order_{oid}_transfer.csv"
+        return resp
+
+    except Exception as e:
+        return http_error(500, "Internal error", detail=f"{e}\n{traceback.format_exc()}")
+
 @app.get("/health")
 def health():
-    return jsonify({"ok": True, "version": "ERP-aware build v1.3 (last-IGR fallback)"})
+    return jsonify({"ok": True, "version": "ERP-aware build v1.3 + export_order_csv"})
